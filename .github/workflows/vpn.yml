@@ -1,0 +1,72 @@
+name: vpn-node
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: "Minutes to keep the node alive (max 350)"
+        required: false
+        default: "350"
+  schedule:
+    - cron: "0 */5 * * *"      # fresh node every 5h, replaces the dying one
+
+concurrency:
+  group: vpn-node
+  cancel-in-progress: true      # newest run wins, no overlapping nodes
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355        # hard cap is 360
+    env:
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      RUN_MINUTES: ${{ inputs.run_minutes || '350' }}
+    steps:
+      - name: Enable IP forwarding
+        run: |
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+          echo 'net.ipv4.ip_forward=1'        | sudo tee -a /etc/sysctl.conf
+          echo 'net.ipv6.conf.all.forwarding=1' | sudo tee -a /etc/sysctl.conf
+
+      - name: Install tailscale
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Join tailnet as exit node
+        run: |
+          for i in $(seq 1 30); do tailscale status >/dev/null 2>&1 && break; sleep 1; done
+          sudo tailscale up \
+            --authkey="$TS_AUTHKEY" \
+            --hostname=gh-vpn \
+            --advertise-exit-node \
+            --accept-dns=false \
+            --ssh \
+            --timeout=60s
+          sleep 3
+          echo "NODE_IP=$(tailscale ip -4)" >> "$GITHUB_ENV"
+
+      - name: Publish address
+        run: |
+          {
+            echo "### VPN node is up"
+            echo ""
+            echo "Tailnet address: \`$NODE_IP\`"
+            echo "MagicDNS name:  \`gh-vpn\`"
+            echo "Exit node: enabled (approve once in the admin console if auto-approve is not set)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep alive
+        run: |
+          END=$((SECONDS + RUN_MINUTES * 60))
+          while [ $SECONDS -lt $END ]; do
+            tailscale status >/dev/null 2>&1 || echo "tailscaled hiccup"
+            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP"
+            sleep 60
+          done
+
+      - name: Leave tailnet
+        if: always()
+        run: sudo tailscale logout || true
