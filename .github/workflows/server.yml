@@ -1,0 +1,274 @@
+name: vpn-node
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: "Minutes to keep the node alive (max 350)"
+        required: false
+        default: "350"
+  schedule:
+    - cron: "0 */5 * * *"      # fresh node every 5h, replaces the dying one
+
+# Tailnet policy required for auto-approved exit nodes (Access controls / policy.json):
+#   "tagOwners":      { "tag:gh-exit": ["autogroup:admin"] },
+#   "autoApprovers":  { "exitNode": ["tag:gh-exit"] },
+# The auth key must also be created with the tag:gh-exit tag selected
+# (plus Reusable + Ephemeral), otherwise tailscale up rejects the tag request.
+
+concurrency:
+  group: vpn-node
+  cancel-in-progress: true      # newest run wins, no overlapping nodes
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355        # hard cap is 360
+    env:
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      # Use `-` with API access tokens; no need to look up the tailnet name.
+      TS_TAILNET: ${{ secrets.TS_TAILNET || '-' }}
+      TS_CLIENT_ID: ${{ secrets.TS_CLIENT_ID }}
+      TS_CLIENT_SECRET: ${{ secrets.TS_CLIENT_SECRET }}
+      RUN_MINUTES: ${{ inputs.run_minutes || '350' }}
+      NODE_NAME: gh-vpn
+      EXIT_TAG: tag:gh-exit
+      # Hermes — leave any of these secrets unset and that part simply stays off
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+      HERMES_BACKUP_TOKEN: ${{ secrets.HERMES_BACKUP_TOKEN }}
+      HERMES_BACKUP_REPO: heydarsaki-dev/HermesBackup
+      HERMES_MODEL: minimaxai/minimax-m3.1-flash
+      NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
+      HERMES_RESTART_DELAY: 10
+    steps:
+      - name: Enable IP forwarding
+        run: |
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+          echo 'net.ipv4.ip_forward=1'        | sudo tee -a /etc/sysctl.conf
+          echo 'net.ipv6.conf.all.forwarding=1' | sudo tee -a /etc/sysctl.conf
+
+      - name: Delete old tailnet nodes
+        run: |
+          token=$(curl -fsSL -d "client_id=$TS_CLIENT_ID" \
+                          -d "client_secret=$TS_CLIENT_SECRET" \
+                          -d "grant_type=client_credentials" \
+                          https://api.tailscale.com/api/v2/oauth/token \
+                  | jq -r '.access_token')
+          curl -fsSL -H "Authorization: Bearer $token" \
+            "https://api.tailscale.com/api/v2/tailnet/$TS_TAILNET/devices" \
+            | jq -r --arg name "$NODE_NAME" '.devices[]? | select(.hostname == $name) | .id' \
+            | while read -r id; do
+                curl -fsSL -X DELETE -H "Authorization: Bearer $token" \
+                  "https://api.tailscale.com/api/v2/device/$id"
+                echo "removed stale node $id"
+              done
+
+      - name: Install tailscale
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Ensure SSH server is available
+        # Tailscale SSH proxies to a local sshd, which is not running on GitHub-hosted runners.
+        # Install and start it BEFORE joining, so `tailscale up --ssh` picks it up.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/sshd_config
+          sudo service ssh start || sudo systemctl start ssh
+          sudo sshd -t
+
+      - name: Join tailnet as exit node
+        run: |
+          for i in $(seq 1 30); do tailscale status >/dev/null 2>&1 && break; sleep 1; done
+          sudo tailscale up \
+            --authkey="$TS_AUTHKEY" \
+            --hostname="$NODE_NAME" \
+            --advertise-exit-node \
+            --advertise-tags="$EXIT_TAG" \
+            --accept-dns=false \
+            --ssh \
+            --timeout=60s
+          sleep 3
+          echo "NODE_IP=$(tailscale ip -4)" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------- Hermes
+      # Every step here is self-contained and skips itself when a secret is
+      # missing, so an unconfigured backup repo or a failed Hermes install can
+      # never take the exit node down with it.
+
+      - name: Restore Hermes state from backup
+        id: hermes_restore
+        run: |
+          if [ -z "$HERMES_BACKUP_TOKEN" ]; then
+            echo "HERMES_BACKUP_TOKEN not set - starting Hermes from scratch"
+            exit 0
+          fi
+          repo="${HERMES_BACKUP_REPO}.git"
+          work="$(mktemp -d)"
+          if ! git clone --quiet --depth 1 \
+              "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${repo}" "$work"; then
+            echo "No readable backup repo (empty or private to another token) - fresh start"
+            rm -rf "$work"
+            exit 0
+          fi
+          zip=$(find "$work" -maxdepth 1 -name '*.zip' | head -1)
+          if [ -z "$zip" ]; then
+            echo "Backup repo is empty - fresh start"
+            rm -rf "$work"
+            exit 0
+          fi
+          cp "$zip" "$HOME/hermes-restore.zip"
+          rm -rf "$work"
+          echo "RESTORE_ZIP=$HOME/hermes-restore.zip" >> "$GITHUB_ENV"
+
+      - name: Install Hermes Agent
+        run: |
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
+            | bash -s -- --non-interactive --skip-browser --skip-computer-use
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          ~/.local/bin/hermes --version
+
+      - name: Import previous Hermes state
+        if: env.RESTORE_ZIP != ''
+        run: |
+          ~/.local/bin/hermes import "$RESTORE_ZIP" --force
+          rm -f "$RESTORE_ZIP"
+
+      - name: Configure Hermes
+        run: |
+          mkdir -p "$HOME/.hermes"
+          # Keep any keys the restored .env already has; only add/update ours.
+          touch "$HOME/.hermes/.env"
+          upsert() { # key, value
+            if grep -q "^$1=" "$HOME/.hermes/.env"; then
+              sed -i "s|^$1=.*|$1=$2|" "$HOME/.hermes/.env"
+            else
+              printf '%s=%s\n' "$1" "$2" >> "$HOME/.hermes/.env"
+            fi
+          }
+          if [ -n "$NVIDIA_API_KEY" ]; then
+            upsert NVIDIA_API_KEY    "$NVIDIA_API_KEY"
+            upsert NVIDIA_BASE_URL   "$NVIDIA_BASE_URL"
+            ~/.local/bin/hermes config set model.provider nvidia
+            ~/.local/bin/hermes config set model.default  "$HERMES_MODEL"
+          else
+            echo "::warning title=Hermes::NVIDIA_API_KEY secret not set - model left as restored"
+          fi
+          if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+            upsert TELEGRAM_BOT_TOKEN     "$TELEGRAM_BOT_TOKEN"
+            upsert TELEGRAM_ALLOWED_USERS "$TELEGRAM_USER_ID"
+          else
+            echo "::warning title=Hermes::TELEGRAM_BOT_TOKEN secret not set - Telegram bridge off"
+          fi
+          chmod 600 "$HOME/.hermes/.env"
+          ~/.local/bin/hermes config check || true
+
+      - name: Start Hermes gateway
+        run: |
+          # Foreground `gateway run` is what a headless host wants, so supervise it
+          # ourselves: no systemd in the runner image, and no supervisor means no
+          # second copy fighting the first one over the bot token.
+          cat > "$HOME/run-hermes-gateway.sh" <<'SH'
+          #!/usr/bin/env bash
+          while true; do
+            "$HOME/.local/bin/hermes" gateway run --replace >> "$HOME/.hermes/logs/gateway.log" 2>&1
+            echo "[$(date -u +%FT%TZ)] gateway exited ($?) - restart in ${HERMES_RESTART_DELAY}s" \
+              >> "$HOME/.hermes/logs/gateway.log"
+            sleep "$HERMES_RESTART_DELAY"
+          done
+          SH
+          chmod +x "$HOME/run-hermes-gateway.sh"
+          mkdir -p "$HOME/.hermes/logs"
+          setsid nohup "$HOME/run-hermes-gateway.sh" >/dev/null 2>&1 &
+          echo $! > "$HOME/hermes-gateway.pid"
+          echo "gateway supervisor pid $(cat "$HOME/hermes-gateway.pid")"
+          for i in $(seq 1 60); do
+            grep -q . "$HOME/.hermes/logs/gateway.log" 2>/dev/null && break
+            sleep 1
+          done
+          tail -40 "$HOME/.hermes/logs/gateway.log" || true
+
+      - name: Publish address
+        run: |
+          {
+            echo "### VPN node is up"
+            echo ""
+            echo "Tailnet address: \`$NODE_IP\`"
+            echo "MagicDNS name:  \`$NODE_NAME\`"
+            echo "Exit node: enabled, auto-approved with \`$EXIT_TAG\` (no manual approval needed)"
+            echo "SSH: \`tailscale ssh runner@$NODE_NAME\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep alive
+        run: |
+          # Stop ~2 min before the job deadline so the backup below always has
+          # room to run: the hard timeout otherwise kills this shell mid-step.
+          END=$((SECONDS + RUN_MINUTES * 60 - 120))
+          while [ $SECONDS -lt $END ]; do
+            tailscale status >/dev/null 2>&1 || echo "tailscaled hiccup"
+            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | $(wc -l < "$HOME/.hermes/logs/gateway.log" 2>/dev/null || echo 0) gateway log lines"
+            sleep 60
+          done
+
+      - name: Stop Hermes gateway
+        if: always()
+        continue-on-error: true
+        run: |
+          # Never copy a live state.db: quiesce the agent before snapshotting it.
+          ~/.local/bin/hermes gateway stop --yes --all >> "$HOME/.hermes/logs/gateway.log" 2>&1 || true
+          # Kill the supervisor and its whole process group first, then anything
+          # still holding the gateway open, so no second copy can grab the token.
+          if [ -f "$HOME/hermes-gateway.pid" ]; then
+            kill -- -"$(cat "$HOME/hermes-gateway.pid")" 2>/dev/null || true
+            kill "$(cat "$HOME/hermes-gateway.pid")" 2>/dev/null || true
+          fi
+          pkill -f 'run-hermes-gateway.sh' 2>/dev/null || true
+          pkill -f 'hermes gateway run' 2>/dev/null || true
+          sleep 2
+          echo "gateway stopped"
+
+      - name: Back up Hermes to GitHub
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -z "$HERMES_BACKUP_TOKEN" ]; then
+            echo "HERMES_BACKUP_TOKEN not set - skipping backup"
+            exit 0
+          fi
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          out="$RUNNER_TEMP/hermes-backup-${stamp}.zip"
+          ~/.local/bin/hermes backup -o "$out"
+          ls -lh "$out"
+
+          # Clear the repo and push only this snapshot. The orphan commit on the
+          # repo's own default branch plus a force push leaves no stale zips and
+          # no old skills behind; every other branch is deleted outright.
+          work="$RUNNER_TEMP/hermes-push"
+          rm -rf "$work"; mkdir -p "$work"; cd "$work"
+          git init -q
+          cp "$out" ./hermes-state.zip
+          git add hermes-state.zip
+          git -c user.name=github-actions -c user.email=github-actions@github.com \
+            commit -q -m "hermes state ${stamp}"
+          origin="https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git"
+          git remote add origin "$origin"
+          branch=$(curl -fsSL -H "Authorization: Bearer ${HERMES_BACKUP_TOKEN}" \
+            "https://api.github.com/repos/${HERMES_BACKUP_REPO}" \
+            | jq -r '.default_branch // empty')
+          branch=${branch:-main}
+          git branch -m "$branch"
+          git push -q --force origin "$branch"
+          git ls-remote --heads origin | awk '{print $2}' | sed 's|refs/heads/||' \
+            | while read -r b; do
+                [ "$b" = "$branch" ] || git push -q origin --delete "$b" || true
+              done
+          echo "Hermes state (${stamp}) pushed to ${HERMES_BACKUP_REPO}"
+
+      - name: Leave tailnet
+        if: always()
+        run: sudo tailscale logout || true
