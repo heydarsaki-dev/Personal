@@ -51,7 +51,11 @@ jobs:
       # v2ray — set V2RAY_DOMAIN and V2RAY_UUID in repo secrets/variables to enable
       V2RAY_DOMAIN: ${{ vars.V2RAY_DOMAIN || '' }}
       V2RAY_UUID: ${{ secrets.V2RAY_UUID || '' }}
-      # Optional: NicNames API token for automatic DNS A-record updates (if you have API access)
+      # Optional: Cloudflare API for automatic DNS A-record updates (recommended)
+      # Get token at https://dash.cloudflare.com/profile/api-tokens (Zone > DNS > Edit)
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN || '' }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID || '' }}
+      # NicNames API token (NOT used for DNS - their API doesn't support record management)
       NICNAMES_API_TOKEN: ${{ secrets.NICNAMES_API_TOKEN || '' }}
       V2RAY_PORT: "8080"
       V2RAY_WS_PATH: "/v2ray"
@@ -114,8 +118,12 @@ jobs:
 
       # ---------------------------------------------------------------- v2ray
       # Install and configure v2ray with WebSocket. Runs on every run because
-      # the runner's public IP changes. If V2RAY_DOMAIN and NICNAMES_API_TOKEN
-      # are set, attempts to update the domain's A record to the new public IP.
+      # the runner's public IP changes. The domain's A record MUST be updated
+      # to the new public IP each run. NicNames API does NOT support DNS record
+      # management (only domain registration). Options:
+      #   1. Manual: Copy the IP from workflow summary → NicNames DNS panel
+      #   2. Cloudflare (recommended): Add domain to Cloudflare, set NS at NicNames
+      #      to Cloudflare's, add CF_API_TOKEN + CF_ZONE_ID secrets for auto-update.
 
       - name: Get public IP
         id: public-ip
@@ -124,23 +132,31 @@ jobs:
           echo "PUBLIC_IP=$PUB_IP" >> "$GITHUB_OUTPUT"
           echo "Runner public IP: $PUB_IP"
 
-      - name: Update DNS A record (NicNames)
-        if: env.V2RAY_DOMAIN != '' && env.NICNAMES_API_TOKEN != ''
+      - name: Update DNS A record (Cloudflare)
+        if: env.V2RAY_DOMAIN != '' && env.CF_API_TOKEN != '' && env.CF_ZONE_ID != ''
         env:
           DOMAIN: ${{ vars.V2RAY_DOMAIN }}
-          API_TOKEN: ${{ secrets.NICNAMES_API_TOKEN }}
+          CF_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ZONE: ${{ secrets.CF_ZONE_ID }}
           PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
         run: |
-          # NOTE: This assumes NicNames has a DNS API endpoint.
-          # You may need to adjust the API URL and payload based on NicNames' actual API.
-          # Common patterns: PATCH/POST to /api/v1/domains/{domain}/records
-          echo "Attempting to update A record for $DOMAIN to $PUBLIC_IP"
-          # Example (adjust to NicNames actual API):
-          # curl -fsS -X PUT "https://api.nicnames.com/v1/domains/$DOMAIN/records/@" \
-          #   -H "Authorization: Bearer $API_TOKEN" \
-          #   -H "Content-Type: application/json" \
-          #   -d '{"type":"A","value":"'"$PUBLIC_IP"'","ttl":300}' \
-          #   && echo "DNS updated successfully" || echo "DNS update failed (check API format)"
+          # Get existing A record ID
+          RECORD_ID=$(curl -fsS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records?type=A&name=@&per_page=1" \
+            | jq -r '.result[0].id // empty')
+          if [ -n "$RECORD_ID" ]; then
+            curl -fsS -X PUT -H "Authorization: Bearer $CF_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records/$RECORD_ID" \
+              -d "{\"type\":\"A\",\"name\":\"@\",\"content\":\"$PUBLIC_IP\",\"ttl\":300,\"proxied\":false}" \
+              && echo "Cloudflare A record updated to $PUBLIC_IP" || echo "Cloudflare update failed"
+          else
+            curl -fsS -X POST -H "Authorization: Bearer $CF_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records" \
+              -d "{\"type\":\"A\",\"name\":\"@\",\"content\":\"$PUBLIC_IP\",\"ttl\":300,\"proxied\":false}" \
+              && echo "Cloudflare A record created for $PUBLIC_IP" || echo "Cloudflare create failed"
+          fi
 
       - name: Install v2ray
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
