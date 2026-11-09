@@ -279,6 +279,37 @@ jobs:
           fi
           "$bin" --version || true
 
+      - name: Set OmniRoute admin password
+        # The dashboard password lives in <DATA_DIR>/storage.sqlite, and a state
+        # restore brings back whatever password the previous run set - so there
+        # is no "default" left to log in with. `omniroute reset-password` is
+        # the only way to change it, and it writes the DB directly, so it goes
+        # after install (the CLI ships inside the package) and before the first
+        # start, while the database is quiesced.
+        continue-on-error: true
+        env:
+          OMNIROUTE_PASSWORD: ${{ secrets.OMNIROUTE_PASSWORD }}
+        run: |
+          bin="$HOME/omniroute-app/node_modules/.bin/omniroute-reset-password"
+          if [ -z "$OMNIROUTE_PASSWORD" ]; then
+            echo "OMNIROUTE_PASSWORD secret not set - keeping the password in the restored state"
+            exit 0
+          fi
+          if [ ! -x "$bin" ]; then
+            echo "::warning title=OmniRoute::omniroute-reset-password not in the install - password unchanged"
+            exit 0
+          fi
+          export DATA_DIR="$HOME/.omniroute"
+          # --password-stdin reads the whole stream as the new password (min 8
+          # chars, no confirmation), so the value is never echoed or logged.
+          if printf '%s' "$OMNIROUTE_PASSWORD" | "$bin" --password-stdin; then
+            echo "OmniRoute admin password applied"
+          else
+            # Fresh install with no storage.sqlite yet: the app creates the DB on
+            # first start, so the next run (state on disk) applies the password.
+            echo "::warning title=OmniRoute::password reset failed (no database yet?)"
+          fi
+
       - name: Start OmniRoute
         run: |
           mkdir -p "$HOME/.omniroute" "$HOME/omniroute-logs"
