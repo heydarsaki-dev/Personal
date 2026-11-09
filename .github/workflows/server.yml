@@ -48,6 +48,13 @@ jobs:
       # OmniRoute — pinned so the cache key and native module ABI stay stable
       OMNIROUTE_VERSION: "3.8.53"
       OMNIROUTE_PORT: "20128"
+      # v2ray — set V2RAY_DOMAIN and V2RAY_UUID in repo secrets/variables to enable
+      V2RAY_DOMAIN: ${{ vars.V2RAY_DOMAIN || '' }}
+      V2RAY_UUID: ${{ secrets.V2RAY_UUID || '' }}
+      # Optional: NicNames API token for automatic DNS A-record updates (if you have API access)
+      NICNAMES_API_TOKEN: ${{ secrets.NICNAMES_API_TOKEN || '' }}
+      V2RAY_PORT: "8080"
+      V2RAY_WS_PATH: "/v2ray"
     steps:
       - name: Enable IP forwarding
         run: |
@@ -63,11 +70,11 @@ jobs:
                           -d "grant_type=client_credentials" \
                           https://api.tailscale.com/api/v2/oauth/token \
                   | jq -r '.access_token')
-          curl -fsSL -H "Authorization: Bearer $token" \
+          curl -fsSL -H "Authorization: Bearer ***" \
             "https://api.tailscale.com/api/v2/tailnet/$TS_TAILNET/devices" \
             | jq -r --arg name "$NODE_NAME" '.devices[]? | select(.hostname == $name) | .id' \
             | while read -r id; do
-                curl -fsSL -X DELETE -H "Authorization: Bearer $token" \
+                curl -fsSL -X DELETE -H "Authorization: Bearer ***" \
                   "https://api.tailscale.com/api/v2/device/$id"
                 echo "removed stale node $id"
               done
@@ -104,6 +111,173 @@ jobs:
             --timeout=60s
           sleep 3
           echo "NODE_IP=$(tailscale ip -4)" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------- v2ray
+      # Install and configure v2ray with WebSocket. Runs on every run because
+      # the runner's public IP changes. If V2RAY_DOMAIN and NICNAMES_API_TOKEN
+      # are set, attempts to update the domain's A record to the new public IP.
+
+      - name: Get public IP
+        id: public-ip
+        run: |
+          PUB_IP=$(curl -fsS https://api.ipify.org || curl -fsS https://ifconfig.me || curl -fsS https://ipinfo.io/ip)
+          echo "PUBLIC_IP=$PUB_IP" >> "$GITHUB_OUTPUT"
+          echo "Runner public IP: $PUB_IP"
+
+      - name: Update DNS A record (NicNames)
+        if: env.V2RAY_DOMAIN != '' && env.NICNAMES_API_TOKEN != ''
+        env:
+          DOMAIN: ${{ vars.V2RAY_DOMAIN }}
+          API_TOKEN: ${{ secrets.NICNAMES_API_TOKEN }}
+          PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
+        run: |
+          # NOTE: This assumes NicNames has a DNS API endpoint.
+          # You may need to adjust the API URL and payload based on NicNames' actual API.
+          # Common patterns: PATCH/POST to /api/v1/domains/{domain}/records
+          echo "Attempting to update A record for $DOMAIN to $PUBLIC_IP"
+          # Example (adjust to NicNames actual API):
+          # curl -fsS -X PUT "https://api.nicnames.com/v1/domains/$DOMAIN/records/@" \
+          #   -H "Authorization: Bearer $API_TOKEN" \
+          #   -H "Content-Type: application/json" \
+          #   -d '{"type":"A","value":"'"$PUBLIC_IP"'","ttl":300}' \
+          #   && echo "DNS updated successfully" || echo "DNS update failed (check API format)"
+
+      - name: Install v2ray
+        if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
+        run: |
+          # Install v2ray (official script)
+          curl -fsSL https://github.com/v2fly/fhs-install-v2ray/raw/master/install-release.sh | sudo bash
+          # Verify
+          /usr/local/bin/v2ray -version
+
+      - name: Generate v2ray config
+        if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
+        env:
+          DOMAIN: ${{ vars.V2RAY_DOMAIN }}
+          UUID: ${{ secrets.V2RAY_UUID }}
+          PORT: ${{ env.V2RAY_PORT }}
+          WS_PATH: ${{ env.V2RAY_WS_PATH }}
+          PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
+        run: |
+          cat > /tmp/config.json <<EOF
+{
+  "inbounds": [
+    {
+      "port": ${PORT},
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "${UUID}",
+            "alterId": 0
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "${WS_PATH}",
+          "headers": {
+            "Host": "${DOMAIN}"
+          }
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ],
+  "dns": {
+    "servers": ["https+local://1.1.1.1/dns-query", "8.8.8.8", "localhost"]
+  }
+}
+EOF
+          sudo mkdir -p /usr/local/etc/v2ray
+          sudo cp /tmp/config.json /usr/local/etc/v2ray/config.json
+          echo "v2ray config written to /usr/local/etc/v2ray/config.json"
+
+      - name: Start v2ray
+        if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
+        run: |
+          # Run v2ray in background, supervised
+          cat > "$HOME/run-v2ray.sh" <<'SH'
+          #!/usr/bin/env bash
+          while true; do
+            /usr/local/bin/v2ray run -config /usr/local/etc/v2ray/config.json >> "$HOME/v2ray.log" 2>&1
+            echo "[$(date -u +%FT%TZ)] v2ray exited ($?) - restart in 10s" >> "$HOME/v2ray.log"
+            sleep 10
+          done
+          SH
+          chmod +x "$HOME/run-v2ray.sh"
+          setsid nohup "$HOME/run-v2ray.sh" >/dev/null 2>&1 &
+          echo $! > "$HOME/v2ray.pid"
+          echo "v2ray supervisor pid $(cat "$HOME/v2ray.pid")"
+          # Wait for startup
+          for i in $(seq 1 20); do
+            if curl -fsS "http://127.0.0.1:${V2RAY_PORT}" >/dev/null 2>&1 || ss -ltn | grep -q ":${V2RAY_PORT} "; then
+              echo "v2ray is listening on port ${V2RAY_PORT}"
+              break
+            fi
+            sleep 1
+          done
+          tail -20 "$HOME/v2ray.log" || true
+
+      - name: Publish v2ray connection info
+        if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
+        env:
+          DOMAIN: ${{ vars.V2RAY_DOMAIN }}
+          UUID: ${{ secrets.V2RAY_UUID }}
+          PORT: ${{ env.V2RAY_PORT }}
+          WS_PATH: ${{ env.V2RAY_WS_PATH }}
+          PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
+          NODE_IP: ${{ env.NODE_IP }}
+        run: |
+          {
+            echo "### v2ray (VMess + WebSocket) is up"
+            echo ""
+            echo "**Public IP:** \`$PUBLIC_IP\`"
+            echo "**Tailscale IP:** \`$NODE_IP\`"
+            echo "**Domain:** \`$DOMAIN\` (point A record to \`$PUBLIC_IP\` if not auto-updated)"
+            echo "**Port:** \`$PORT\`"
+            echo "**UUID:** \`$UUID\`"
+            echo "**WebSocket Path:** \`$WS_PATH\`"
+            echo "**Network:** ws"
+            echo "**Security:** none (use Cloudflare proxy for TLS, or add TLS certs)"
+            echo ""
+            echo "#### VMess link (for V2RayN, v2rayNG, Clash, etc.)"
+            # Generate base64 VMess link
+            VMESS_JSON=$(cat <<EOJ
+{
+  "v": "2",
+  "ps": "gh-v2ray-$DOMAIN",
+  "add": "$DOMAIN",
+  "port": "$PORT",
+  "id": "$UUID",
+  "aid": "0",
+  "scy": "auto",
+  "net": "ws",
+  "type": "none",
+  "host": "$DOMAIN",
+  "path": "$WS_PATH",
+  "tls": "",
+  "sni": "$DOMAIN",
+  "alpn": ""
+}
+EOJ
+)
+            VMESS_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w0)"
+            echo "\`$VMESS_LINK\`"
+            echo ""
+            echo "> **Note:** The runner IP changes every run. Update your DNS A record for \`$DOMAIN\` to \`$PUBLIC_IP\` or use the VMess link with \`add\` set to the current IP."
+            echo "> For TLS, put Cloudflare in front (orange cloud) or add certs to v2ray config."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # ---------------------------------------------------------------- Restore
       # One clone restores both apps. Each piece is optional: a missing zip
@@ -381,7 +555,15 @@ jobs:
           while [ $SECONDS -lt $END ]; do
             tailscale status >/dev/null 2>&1 || echo "tailscaled hiccup"
             omni=$(curl -fsS "http://$NODE_IP:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1 && echo ok || echo down)
-            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | hermes $(wc -l < "$HOME/.hermes/logs/gateway.log" 2>/dev/null || echo 0) log lines | omniroute $omni"
+            v2ray_status="off"
+            if [ -n "${V2RAY_DOMAIN:-}" ] && [ -n "${V2RAY_UUID:-}" ]; then
+              if curl -fsS "http://127.0.0.1:${V2RAY_PORT}" >/dev/null 2>&1 || ss -ltn | grep -q ":${V2RAY_PORT} "; then
+                v2ray_status="up"
+              else
+                v2ray_status="down"
+              fi
+            fi
+            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | hermes $(wc -l < "$HOME/.hermes/logs/gateway.log" 2>/dev/null || echo 0) log lines | omniroute $omni | v2ray $v2ray_status"
             sleep 60
           done
 
@@ -416,6 +598,19 @@ jobs:
           pkill -f 'omniroute.*serve' 2>/dev/null || true
           sleep 3
           echo "omniroute stopped"
+
+      - name: Stop v2ray
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f "$HOME/v2ray.pid" ]; then
+            kill -- -"$(cat "$HOME/v2ray.pid")" 2>/dev/null || true
+            kill "$(cat "$HOME/v2ray.pid")" 2>/dev/null || true
+          fi
+          pkill -f 'run-v2ray.sh' 2>/dev/null || true
+          pkill -f 'v2ray run' 2>/dev/null || true
+          sleep 2
+          echo "v2ray stopped"
 
       - name: Back up state to GitHub
         if: always()
