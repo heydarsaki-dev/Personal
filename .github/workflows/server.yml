@@ -17,7 +17,7 @@ on:
 # (plus Reusable + Ephemeral), otherwise tailscale up rejects the tag request.
 
 concurrency:
-  group: vpn-node
+  group: server
   cancel-in-progress: true      # newest run wins, no overlapping nodes
 
 permissions:
@@ -76,9 +76,15 @@ jobs:
         # Tailscale SSH proxies to a local sshd, which is not running on GitHub-hosted runners.
         # Install and start it BEFORE joining, so `tailscale up --ssh` picks it up.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq openssh-server
-          sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/sshd_config
+          # No -qq here: a silent apt failure shows up much later as a broken SSH hop.
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server
+          # Ubuntu ships /etc/ssh/sshd_config (/etc/sshd_config is the RHEL path).
+          cfg=$(ls /etc/ssh/sshd_config /etc/sshd_config 2>/dev/null | head -1)
+          if [ -n "$cfg" ]; then
+            sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "$cfg"
+          fi
+          sudo ssh-keygen -A          # host keys may be absent if sshd was never started
           sudo service ssh start || sudo systemctl start ssh
           sudo sshd -t
 
