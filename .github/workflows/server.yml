@@ -45,6 +45,9 @@ jobs:
       HERMES_MODEL: minimaxai/minimax-m3.1-flash
       NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
       HERMES_RESTART_DELAY: 10
+      # OmniRoute — pinned so the cache key and native module ABI stay stable
+      OMNIROUTE_VERSION: "3.8.53"
+      OMNIROUTE_PORT: "20128"
     steps:
       - name: Enable IP forwarding
         run: |
@@ -102,35 +105,76 @@ jobs:
           sleep 3
           echo "NODE_IP=$(tailscale ip -4)" >> "$GITHUB_ENV"
 
+      # ---------------------------------------------------------------- Restore
+      # One clone restores both apps. Each piece is optional: a missing zip
+      # simply means that app starts from scratch.
+
+      - name: Restore state from backup
+        id: restore
+        run: |
+          if [ -z "$HERMES_BACKUP_TOKEN" ]; then
+            echo "HERMES_BACKUP_TOKEN not set - starting from scratch"
+            exit 0
+          fi
+          work="$(mktemp -d)"
+          if ! git clone --quiet --depth 1 \
+              "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git" "$work"; then
+            echo "No readable backup repo (missing, empty or private) - fresh start"
+            rm -rf "$work"
+            exit 0
+          fi
+          if [ -f "$work/hermes-state.zip" ]; then
+            cp "$work/hermes-state.zip" "$HOME/hermes-restore.zip"
+            echo "RESTORE_ZIP=$HOME/hermes-restore.zip" >> "$GITHUB_ENV"
+            echo "found Hermes backup"
+          else
+            echo "no Hermes backup - fresh start"
+          fi
+          if [ -f "$work/omniroute-state.zip" ]; then
+            unzip -oq "$work/omniroute-state.zip" -d "$HOME"
+            chmod 600 "$HOME/.omniroute/.env" 2>/dev/null || true
+            echo "restored OmniRoute state"
+          else
+            echo "no OmniRoute backup - fresh start"
+          fi
+          rm -rf "$work"
+
+      # --------------------------------------------------------- Hermes caches
+      # Hermes' heavy install artifacts: pm's tool store (the pinned uv 0.13.5,
+      # the pinned Python, and the tool binaries `hermes pm` published), the uv
+      # wheel cache the venv sync pulls from, and the install state under
+      # ~/.hermes/installs (facts.json naming the selected generation, plus that
+      # generation's venv and its resolved workspace). A warm cache is why a
+      # repeat run skips the venv sync entirely: pm stamps the sync against
+      # uv.lock + pyproject layout + extras + the pinned Python, so when the stamp
+      # in facts.json still matches and the venv it names is present, the sync is
+      # a no-op instead of a rebuild.
+
+      # All three paths MUST stay in this one cache entry: pm builds each
+      # generation's venv against the interpreter in ~/.hermes/tools and records
+      # absolute paths (into ~/.hermes/tools and ~/.hermes/installs), so a venv
+      # restored without its pinned tool store would not run, and the recorded
+      # generation path has to match where it was restored.
+
+      # The key is versioned: the venv generation only describes itself once
+      # built, so if the key changes the sync re-runs - which is correct, since a
+      # new lock/extras/python pin may require it.
+
+      - name: Cache Hermes runtime
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.hermes/tools
+            ~/.hermes/cache/uv
+            ~/.hermes/installs
+          key: hermes-${{ runner.os }}-tools-v1
+          restore-keys: |
+            hermes-${{ runner.os }}-tools-
+
       # ---------------------------------------------------------------- Hermes
       # Every step here is self-contained and skips itself when a secret is
       # missing, so an unconfigured backup repo or a failed Hermes install can
       # never take the exit node down with it.
-
-      - name: Restore Hermes state from backup
-        id: hermes_restore
-        run: |
-          if [ -z "$HERMES_BACKUP_TOKEN" ]; then
-            echo "HERMES_BACKUP_TOKEN not set - starting Hermes from scratch"
-            exit 0
-          fi
-          repo="${HERMES_BACKUP_REPO}.git"
-          work="$(mktemp -d)"
-          if ! git clone --quiet --depth 1 \
-              "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${repo}" "$work"; then
-            echo "No readable backup repo (empty or private to another token) - fresh start"
-            rm -rf "$work"
-            exit 0
-          fi
-          zip=$(find "$work" -maxdepth 1 -name '*.zip' | head -1)
-          if [ -z "$zip" ]; then
-            echo "Backup repo is empty - fresh start"
-            rm -rf "$work"
-            exit 0
-          fi
-          cp "$zip" "$HOME/hermes-restore.zip"
-          rm -rf "$work"
-          echo "RESTORE_ZIP=$HOME/hermes-restore.zip" >> "$GITHUB_ENV"
 
       - name: Install Hermes Agent
         run: |
@@ -199,6 +243,86 @@ jobs:
           done
           tail -40 "$HOME/.hermes/logs/gateway.log" || true
 
+      # -------------------------------------------------------------- OmniRoute
+      # OmniRoute needs a modern Node (engines: >=22.22.2 <23 || >=24 <27) and
+      # is large (~915 MB unpacked), so its install prefix and npm cache are
+      # restored from Actions cache instead of being rebuilt on every run.
+
+      - name: Set up Node.js for OmniRoute
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Cache npm downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-node24-${{ env.OMNIROUTE_VERSION }}
+          restore-keys: |
+            npm-${{ runner.os }}-node24-
+
+      - name: Cache OmniRoute install
+        # Exact key, no restore-keys: a version bump must not reuse an old install.
+        uses: actions/cache@v4
+        with:
+          path: ~/omniroute-app
+          key: omniroute-${{ runner.os }}-node24-${{ env.OMNIROUTE_VERSION }}
+
+      - name: Install OmniRoute
+        run: |
+          bin="$HOME/omniroute-app/node_modules/.bin/omniroute"
+          if [ -x "$bin" ]; then
+            echo "OmniRoute ${OMNIROUTE_VERSION} restored from cache"
+          else
+            npm install --prefix "$HOME/omniroute-app" --no-audit --no-fund \
+              "omniroute@${OMNIROUTE_VERSION}"
+          fi
+          "$bin" --version || true
+
+      - name: Start OmniRoute
+        run: |
+          mkdir -p "$HOME/.omniroute" "$HOME/omniroute-logs"
+          export DATA_DIR="$HOME/.omniroute"
+          export PORT="$OMNIROUTE_PORT"
+          export DASHBOARD_PORT="$OMNIROUTE_PORT"
+          export API_PORT="$OMNIROUTE_PORT"
+          # The runner also has a public IP. Bind only the tailnet address so the
+          # dashboard/API is reachable over Tailscale and nowhere else. OmniRoute's
+          # own readiness probe only checks loopback, so probe $NODE_IP below.
+          export OMNIROUTE_SERVER_HOST="$NODE_IP"
+          export REQUIRE_API_KEY=true
+          export OMNIROUTE_NO_UPDATE_NOTIFIER=1
+          export OMNIROUTE_MEMORY_MB=4096
+          export OMNIROUTE_READY_TIMEOUT_MS=120000
+          export OMNIROUTE_RESTART_DELAY=10
+          cat > "$HOME/run-omniroute.sh" <<'SH'
+          #!/usr/bin/env bash
+          BIN="$HOME/omniroute-app/node_modules/.bin/omniroute"
+          while true; do
+            "$BIN" serve --no-open >> "$HOME/omniroute-logs/omniroute.log" 2>&1
+            echo "[$(date -u +%FT%TZ)] omniroute exited ($?) - restart in ${OMNIROUTE_RESTART_DELAY}s" >> "$HOME/omniroute-logs/omniroute.log"
+            sleep "${OMNIROUTE_RESTART_DELAY:-10}"
+          done
+          SH
+          chmod +x "$HOME/run-omniroute.sh"
+          setsid nohup "$HOME/run-omniroute.sh" >/dev/null 2>&1 &
+          echo $! > "$HOME/omniroute.pid"
+          echo "omniroute supervisor pid $(cat "$HOME/omniroute.pid")"
+          healthy=0
+          for i in $(seq 1 90); do
+            if curl -fsS "http://$NODE_IP:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$healthy" = 1 ]; then
+            echo "OmniRoute is healthy on http://$NODE_IP:${OMNIROUTE_PORT}"
+          else
+            echo "::warning title=OmniRoute::not healthy after 180s - see the log below"
+          fi
+          tail -40 "$HOME/omniroute-logs/omniroute.log" || true
+
       - name: Publish address
         run: |
           {
@@ -208,16 +332,25 @@ jobs:
             echo "MagicDNS name:  \`$NODE_NAME\`"
             echo "Exit node: enabled, auto-approved with \`$EXIT_TAG\` (no manual approval needed)"
             echo "SSH: \`tailscale ssh runner@$NODE_NAME\`"
+            echo ""
+            echo "OmniRoute dashboard: http://$NODE_NAME:$OMNIROUTE_PORT  _(MagicDNS, tailnet only)_"
+            echo ""
+            echo "OmniRoute dashboard: http://$NODE_IP:$OMNIROUTE_PORT  _(tailnet only)_"
+            echo ""
+            echo "> OmniRoute listens on the Tailscale interface only; it is **not** on the public internet."
+            echo "> Hermes talks to you on Telegram and exposes no inbound port."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep alive
         run: |
-          # Stop ~2 min before the job deadline so the backup below always has
-          # room to run: the hard timeout otherwise kills this shell mid-step.
-          END=$((SECONDS + RUN_MINUTES * 60 - 120))
+          # Stop ~5 min before the job deadline: the backup and the post-job
+          # cache saves (Hermes runtime, npm, OmniRoute install) still have to run,
+          # and the hard timeout would otherwise kill this shell mid-step.
+          END=$((SECONDS + RUN_MINUTES * 60 - 300))
           while [ $SECONDS -lt $END ]; do
             tailscale status >/dev/null 2>&1 || echo "tailscaled hiccup"
-            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | $(wc -l < "$HOME/.hermes/logs/gateway.log" 2>/dev/null || echo 0) gateway log lines"
+            omni=$(curl -fsS "http://$NODE_IP:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1 && echo ok || echo down)
+            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | hermes $(wc -l < "$HOME/.hermes/logs/gateway.log" 2>/dev/null || echo 0) log lines | omniroute $omni"
             sleep 60
           done
 
@@ -238,7 +371,22 @@ jobs:
           sleep 2
           echo "gateway stopped"
 
-      - name: Back up Hermes to GitHub
+      - name: Stop OmniRoute
+        if: always()
+        continue-on-error: true
+        run: |
+          # Kill the supervisor's whole process group first, otherwise its
+          # restart loop brings `serve` back while the DB is being zipped.
+          if [ -f "$HOME/omniroute.pid" ]; then
+            kill -- -"$(cat "$HOME/omniroute.pid")" 2>/dev/null || true
+            kill "$(cat "$HOME/omniroute.pid")" 2>/dev/null || true
+          fi
+          pkill -f 'run-omniroute.sh' 2>/dev/null || true
+          pkill -f 'omniroute.*serve' 2>/dev/null || true
+          sleep 3
+          echo "omniroute stopped"
+
+      - name: Back up state to GitHub
         if: always()
         continue-on-error: true
         run: |
@@ -247,33 +395,102 @@ jobs:
             exit 0
           fi
           stamp=$(date -u +%Y%m%dT%H%M%SZ)
-          out="$RUNNER_TEMP/hermes-backup-${stamp}.zip"
-          ~/.local/bin/hermes backup -o "$out"
-          ls -lh "$out"
+          out="$RUNNER_TEMP/state-out"
+          rm -rf "$out"; mkdir -p "$out"
+          ok=1
 
-          # Clear the repo and push only this snapshot. The orphan commit on the
-          # repo's own default branch plus a force push leaves no stale zips and
-          # no old skills behind; every other branch is deleted outright.
-          work="$RUNNER_TEMP/hermes-push"
-          rm -rf "$work"; mkdir -p "$work"; cd "$work"
-          git init -q
-          cp "$out" ./hermes-state.zip
-          git add hermes-state.zip
-          git -c user.name=github-actions -c user.email=github-actions@github.com \
-            commit -q -m "hermes state ${stamp}"
-          origin="https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git"
-          git remote add origin "$origin"
+          # Hermes keeps its own archive format, restorable with `hermes import`.
+          if [ -x "$HOME/.local/bin/hermes" ]; then
+            if ! ~/.local/bin/hermes backup -o "$out/hermes-state.zip"; then
+              echo "::warning title=Backup::hermes backup failed"
+              ok=0
+            fi
+          fi
+
+          # OmniRoute: the sqlite DB and its .env (STORAGE_ENCRYPTION_KEY) only
+          # make sense together, and the app is already stopped above.
+          if [ -x "$HOME/omniroute-app/node_modules/.bin/omniroute" ] && [ -d "$HOME/.omniroute" ]; then
+            if ! ( cd "$HOME" && zip -qr "$out/omniroute-state.zip" .omniroute -x '.omniroute/logs/*' ); then
+              echo "::warning title=Backup::omniroute backup failed"
+              ok=0
+            fi
+          fi
+
+          if [ ! -f "$out/hermes-state.zip" ] && [ ! -f "$out/omniroute-state.zip" ]; then
+            echo "no state captured - leaving the existing backup untouched"
+            exit 0
+          fi
+          if [ "$ok" != 1 ]; then
+            echo "::warning title=Backup::a snapshot failed - keeping the previous backup to avoid data loss"
+            exit 0
+          fi
+
+          # Update the existing repo instead of wiping it, so a run that cannot
+          # snapshot one app never deletes the other app's last good backup.
           branch=$(curl -fsSL -H "Authorization: Bearer ${HERMES_BACKUP_TOKEN}" \
             "https://api.github.com/repos/${HERMES_BACKUP_REPO}" \
             | jq -r '.default_branch // empty')
           branch=${branch:-main}
-          git branch -m "$branch"
+          work="$RUNNER_TEMP/state-push"
+          rm -rf "$work"
+          if ! git clone --quiet \
+              "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git" "$work" 2>/dev/null; then
+            mkdir -p "$work"
+            git -C "$work" init -q
+            git -C "$work" remote add origin \
+              "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git"
+          fi
+          cd "$work"
+          cp "$out"/*.zip ./
+          git add -f ./*.zip
+          git -c user.name=github-actions -c user.email=github-actions@github.com \
+            commit -q -m "state ${stamp}" || { echo "no changes to commit"; exit 0; }
+          git branch -M "$branch"
           git push -q --force origin "$branch"
           git ls-remote --heads origin | awk '{print $2}' | sed 's|refs/heads/||' \
             | while read -r b; do
                 [ "$b" = "$branch" ] || git push -q origin --delete "$b" || true
               done
-          echo "Hermes state (${stamp}) pushed to ${HERMES_BACKUP_REPO}"
+          echo "state (${stamp}) pushed to ${HERMES_BACKUP_REPO}"
+
+      # ------------------------------------------------- prune stale Hermes
+      # pm never deletes a venv generation it built until it has gone unselected
+      # for 24h with no live lease (collect_generations), so a cache that carries
+      # ~/.hermes/installs would otherwise grow one whole generation per lock
+      # bump. facts.json names the generation pm actually selected, so keeping
+      # that one and dropping its siblings is the same rule pm applies - just
+      # now, while the runner is about to hand the tree back to the cache.
+      # Must run before the job's post cache save to have any effect.
+
+      - name: Prune superseded Hermes environments
+        if: always()
+        continue-on-error: true
+        run: |
+          root="$HOME/.hermes/installs"
+          [ -d "$root" ] || exit 0
+          before=$(du -sh "$root" 2>/dev/null | cut -f1)
+          python3 - "$root" <<'PY'
+          import json, shutil, sys
+          from pathlib import Path
+          for facts in sorted(Path(sys.argv[1]).glob("*/facts.json")):
+              try:
+                  data = json.loads(facts.read_text(encoding="utf-8-sig"))
+                  selected = Path(data["packages"]["venv"]["environment"]).resolve()
+              except Exception:
+                  continue  # no published selection yet: nothing is provably stale
+              if not selected.is_dir():
+                  continue  # the cache lost what pm selected; keep the rest as evidence
+              generation = selected.parent
+              if generation.parent.name != "environments" \
+                  or generation.parent.parent != facts.parent.resolve():
+                  continue  # the recording is from another machine or another layout
+              for sibling in sorted(generation.parent.iterdir()):
+                  if sibling.is_dir() and sibling.resolve() != generation:
+                      print(f"removing superseded generation {sibling}")
+                      shutil.rmtree(sibling, ignore_errors=True)
+          PY
+          after=$(du -sh "$root" 2>/dev/null | cut -f1)
+          echo "hermes installs: ${before:-0} -> ${after:-0}"
 
       - name: Leave tailnet
         if: always()
