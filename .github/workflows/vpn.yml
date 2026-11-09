@@ -10,6 +10,12 @@ on:
   schedule:
     - cron: "0 */5 * * *"      # fresh node every 5h, replaces the dying one
 
+# Tailnet policy required for auto-approved exit nodes (Access controls / policy.json):
+#   "tagOwners":      { "tag:gh-exit": ["autogroup:admin"] },
+#   "autoApprovers":  { "exitNode": ["tag:gh-exit"] },
+# The auth key must also be created with the tag:gh-exit tag selected
+# (plus Reusable + Ephemeral), otherwise tailscale up rejects the tag request.
+
 concurrency:
   group: vpn-node
   cancel-in-progress: true      # newest run wins, no overlapping nodes
@@ -23,7 +29,12 @@ jobs:
     timeout-minutes: 355        # hard cap is 360
     env:
       TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      TS_TAILNET: ${{ secrets.TS_TAILNET }}
+      TS_CLIENT_ID: ${{ secrets.TS_CLIENT_ID }}
+      TS_CLIENT_SECRET: ${{ secrets.TS_CLIENT_SECRET }}
       RUN_MINUTES: ${{ inputs.run_minutes || '350' }}
+      NODE_NAME: gh-vpn
+      EXIT_TAG: tag:gh-exit
     steps:
       - name: Enable IP forwarding
         run: |
@@ -31,6 +42,23 @@ jobs:
           sudo sysctl -w net.ipv6.conf.all.forwarding=1
           echo 'net.ipv4.ip_forward=1'        | sudo tee -a /etc/sysctl.conf
           echo 'net.ipv6.conf.all.forwarding=1' | sudo tee -a /etc/sysctl.conf
+
+      - name: Delete old tailnet nodes
+        # Requires an OAuth client with devices:core:read + devices:core:write
+        run: |
+          token=$(curl -fsSL -d "client_id=$TS_CLIENT_ID" \
+                          -d "client_secret=$TS_CLIENT_SECRET" \
+                          -d "grant_type=client_credentials" \
+                          https://api.tailscale.com/api/v2/oauth/token \
+                  | jq -r '.access_token')
+          curl -fsSL -H "Authorization: Bearer $token" \
+            "https://api.tailscale.com/api/v2/tailnet/$TS_TAILNET/devices" \
+            | jq -r --arg name "$NODE_NAME" '.devices[]? | select(.hostname == $name) | .id' \
+            | while read -r id; do
+                curl -fsSL -X DELETE -H "Authorization: Bearer $token" \
+                  "https://api.tailscale.com/api/v2/device/$id"
+                echo "removed stale node $id"
+              done
 
       - name: Install tailscale
         run: curl -fsSL https://tailscale.com/install.sh | sh
@@ -40,8 +68,9 @@ jobs:
           for i in $(seq 1 30); do tailscale status >/dev/null 2>&1 && break; sleep 1; done
           sudo tailscale up \
             --authkey="$TS_AUTHKEY" \
-            --hostname=gh-vpn \
+            --hostname="$NODE_NAME" \
             --advertise-exit-node \
+            --advertise-tags="$EXIT_TAG" \
             --accept-dns=false \
             --ssh \
             --timeout=60s
@@ -54,8 +83,8 @@ jobs:
             echo "### VPN node is up"
             echo ""
             echo "Tailnet address: \`$NODE_IP\`"
-            echo "MagicDNS name:  \`gh-vpn\`"
-            echo "Exit node: enabled (approve once in the admin console if auto-approve is not set)"
+            echo "MagicDNS name:  \`$NODE_NAME\`"
+            echo "Exit node: auto-approved via \`$EXIT_TAG\` (no manual approval)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep alive
