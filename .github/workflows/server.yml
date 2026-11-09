@@ -1,4 +1,4 @@
-name: vpn-node
+name: server
 
 on:
   workflow_dispatch:
