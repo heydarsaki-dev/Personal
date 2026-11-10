@@ -59,7 +59,7 @@ jobs:
       # v2ray — published on a subdomain so the apex record is left alone.
       # Change the host here if you move it; the A record lives in the
       # heydarsaki.bond Cloudflare zone.
-      V2RAY_DOMAIN: ${{ secrets.V2RAY_DOMAIN  || '' }}
+      V2RAY_DOMAIN: ${{ vars.V2RAY_DOMAIN  || '' }}
       V2RAY_UUID: ${{ secrets.V2RAY_UUID || '' }}
       # Optional: Cloudflare API for automatic DNS A-record updates (recommended)
       # Get token at https://dash.cloudflare.com/profile/api-tokens (Zone > DNS > Edit)
