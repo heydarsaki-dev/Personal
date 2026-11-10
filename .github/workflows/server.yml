@@ -29,14 +29,12 @@ jobs:
     timeout-minutes: 355        # hard cap is 360
     env:
       TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
-      # Use `-` with API access tokens; no need to look up the tailnet name.
       TS_TAILNET: ${{ secrets.TS_TAILNET || '-' }}
       TS_CLIENT_ID: ${{ secrets.TS_CLIENT_ID }}
       TS_CLIENT_SECRET: ${{ secrets.TS_CLIENT_SECRET }}
       RUN_MINUTES: ${{ inputs.run_minutes || '350' }}
       NODE_NAME: gh-vpn
       EXIT_TAG: tag:gh-exit
-      # Hermes — leave any of these secrets unset and that part simply stays off
       NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
@@ -45,32 +43,23 @@ jobs:
       HERMES_MODEL: minimaxai/minimax-m3.1-flash
       NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
       HERMES_RESTART_DELAY: 10
-      # Hermes via OmniRoute: set the OMNIROUTE_API_KEY secret and "Configure
-      # Hermes" points the agent at OmniRoute instead of at NVIDIA directly.
-      # Leave it unset and the NVIDIA branch in that step keeps driving Hermes,
-      # so nothing changes until you explicitly switch.
       OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
-      # The combo name as configured in the OmniRoute dashboard. Hermes asks for
-      # it verbatim as model.default, so it must match the combo exactly.
       OMNIROUTE_MODEL: ${{ vars.OMNIROUTE_MODEL || 'MyCombo' }}
-      # OmniRoute — pinned so the cache key and native module ABI stay stable
       OMNIROUTE_VERSION: "3.8.53"
       OMNIROUTE_PORT: "20128"
-      # v2ray — published on a subdomain so the apex record is left alone.
-      # Change the host here if you move it; the A record lives in the
-      # heydarsaki.bond Cloudflare zone.
       V2RAY_DOMAIN: ${{ vars.V2RAY_DOMAIN  || '' }}
       V2RAY_UUID: ${{ secrets.V2RAY_UUID || '' }}
-      # Optional: Cloudflare API for automatic DNS A-record updates (recommended)
-      # Get token at https://dash.cloudflare.com/profile/api-tokens (Zone > DNS > Edit)
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN || '' }}
       CF_ZONE_ID: ${{ secrets.CF_ZONE_ID || '' }}
-      # When "true" (default) Cloudflare proxies the A record (orange cloud),
-      # so clients reach v2ray through Cloudflare on 443/TLS and the runner
-      # needs no inbound port. When "false" the record is DNS-only (grey cloud)
-      # and clients talk straight to the runner's public IP on 8080.
-      CF_PROXIED: ${{ vars.CF_PROXIED || 'true' }}
-      # NicNames API token (NOT used for DNS - their API doesn't support record management)
+      # Cloudflare Tunnel: the runner dials OUT to Cloudflare, so no inbound
+      # port is needed on the GitHub Actions runner. Requires CF_ACCOUNT_ID
+      # and CF_TUNNEL_ID secrets.
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || '' }}
+      CF_TUNNEL_ID: ${{ secrets.CF_TUNNEL_ID || '' }}
+      # DNS record mode: "grey" = DNS-only A record (clients connect via
+      # Cloudflare Tunnel on 443). "orange" = proxied A record (WILL NOT WORK
+      # on a GitHub Actions runner - Cloudflare cannot reach inbound ports).
+      CF_MODE: ${{ vars.CF_MODE || 'grey' }}
       NICNAMES_API_TOKEN: ${{ secrets.NICNAMES_API_TOKEN || '' }}
       V2RAY_PORT: "8080"
       V2RAY_WS_PATH: "/v2ray"
@@ -101,13 +90,6 @@ jobs:
       - name: Install tailscale
         run: curl -fsSL https://tailscale.com/install.sh | sh
 
-      # apt-get update is the slowest fixed cost before the node is up, and its
-      # output is the same on every run of the same runner image, so the package
-      # index and the fetched .debs ride along in one tarball cache under $HOME
-      # (actions/cache unpacks as the runner user, so it cannot write into
-      # /var/lib/apt itself). The run id makes every run save a fresh entry and
-      # restore-keys picks the newest, so the index does not age forever; when it
-      # has aged anyway, the install step falls back to a real update once.
       - name: Cache apt index and packages
         uses: actions/cache@v4
         with:
@@ -117,13 +99,9 @@ jobs:
             apt-${{ runner.os }}-ssh-
 
       - name: Ensure SSH server is available
-        # Tailscale SSH proxies to a local sshd, which is not running on GitHub-hosted runners.
-        # Install and start it BEFORE joining, so `tailscale up --ssh` picks it up.
         run: |
           cache="$HOME/.apt-cache"
           mkdir -p "$cache"
-          # Warm start: a cached index lets apt resolve the package without
-          # downloading it, and a cached .deb lets it skip the fetch entirely.
           if [ -f "$cache/lists.tar" ]; then
             sudo mkdir -p /var/lib/apt/lists
             sudo tar -C /var/lib/apt/lists -xf "$cache/lists.tar" 2>/dev/null \
@@ -134,26 +112,21 @@ jobs:
             sudo tar -C /var/cache/apt/archives -xf "$cache/archives.tar" 2>/dev/null \
               && echo "restored cached .deb packages"
           fi
-          # No -qq here: a silent apt failure shows up much later as a broken SSH hop.
           install_sshd() {
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server
           }
-          # A stale index (image bump, mirror roll) fails fast instead of
-          # hanging, so pay for the real update only when the cache is unusable.
           if ! install_sshd; then
             echo "cached apt index unusable - running apt-get update"
             sudo apt-get update
             install_sshd
           fi
-          # Hand the freshest index and .debs to the next run.
           sudo tar -C /var/lib/apt/lists -cf "$cache/lists.tar" . 2>/dev/null || true
           sudo tar -C /var/cache/apt/archives -cf "$cache/archives.tar" . 2>/dev/null || true
-          # Ubuntu ships /etc/ssh/sshd_config (/etc/sshd_config is the RHEL path).
           cfg=$(ls /etc/ssh/sshd_config /etc/sshd_config 2>/dev/null | head -1)
           if [ -n "$cfg" ]; then
             sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "$cfg"
           fi
-          sudo ssh-keygen -A          # host keys may be absent if sshd was never started
+          sudo ssh-keygen -A
           sudo service ssh start || sudo systemctl start ssh
           sudo sshd -t
 
@@ -172,23 +145,9 @@ jobs:
           echo "NODE_IP=$(tailscale ip -4)" >> "$GITHUB_ENV"
 
       # ---------------------------------------------------------------- v2ray
-      # Install and configure v2ray with WebSocket. Runs on every run because
-      # the runner's public IP changes. The domain's A record MUST be updated
-      # to the new public IP each run. NicNames API does NOT support DNS record
-      # management (only domain registration). Options:
-      #   1. Manual: Copy the IP from workflow summary -> NicNames DNS panel
-      #   2. Cloudflare (recommended): Add domain to Cloudflare, set NS at NicNames
-      #      to Cloudflare's, add a CF_API_TOKEN secret for auto-update: either a
-      #      scoped API Token (Zone.DNS Edit) sent as Bearer, or a Global API
-      #      Key (37 hex chars) plus CF_API_EMAIL sent as X-Auth-Key.
-      #      CF_ZONE_ID is optional - the zone is looked up by name.
-
-      # NOTE ON INDENTATION: every line of a heredoc body below is indented to
-      # this step's block level (10 spaces) or deeper, and each terminator (EOF,
-      # EOJ, SH) sits at exactly 10. YAML strips that 10-space block indent, so
-      # the shell still receives the terminators at column 0, where a plain
-      # <<EOF heredoc requires them. A JSON line left at column 0 would end the
-      # run: | block scalar and break the whole workflow file.
+      # Install and configure v2ray with WebSocket on localhost:8080.
+      # Cloudflare Tunnel (cloudflared) forwards public 443/TLS traffic down
+      # an outbound connection to localhost:8080. No inbound port needed.
 
       - name: Get public IP
         id: public-ip
@@ -197,60 +156,36 @@ jobs:
           echo "PUBLIC_IP=$PUB_IP" >> "$GITHUB_OUTPUT"
           echo "Runner public IP: $PUB_IP"
 
-      - name: Update Cloudflare DNS A record (apex + www)
-        # Runs every workflow run so the record always points at the current
-        # runner IP. When CF_PROXIED=true it is orange-clouded, so Cloudflare
-        # proxies 443/TLS -> runner:8080/plain.
+      - name: Update Cloudflare DNS A record (grey cloud)
+        # Grey-cloud A record so the domain resolves to the runner IP.
+        # Traffic does NOT go directly to the runner (blocked on GH Actions).
+        # Instead, Cloudflare Tunnel handles the public ingress on 443.
         if: env.V2RAY_DOMAIN != '' && env.CF_API_TOKEN != ''
         env:
           DOMAIN: ${{ env.V2RAY_DOMAIN }}
           CF_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          # Optional, only for a Global API Key (37 hex chars); a scoped API
-          # Token authenticates with the Bearer header and needs neither.
           CF_EMAIL: ${{ secrets.CF_API_EMAIL }}
-          # Optional: the zone id is derived from DOMAIN, this is only a fallback
-          # for domains whose zone name differs from DOMAIN.
           CF_ZONE: ${{ secrets.CF_ZONE_ID }}
           PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
-          PROXIED: ${{ env.CF_PROXIED }}
         run: |
-          # Resolve the zone from the domain instead of trusting the
-          # CF_ZONE_ID secret: a stale/mismatched zone id fails with Cloudflare's
-          # opaque 7003 "Could not route...". The credential is the only value
-          # that has to be right, so normalise and type-check it first.
-          # A secret pasted from a browser often keeps quotes/newlines around
-          # the value, which Cloudflare answers with 9106 "Authentication
-          # failed" no matter what the token's permissions are.
           CF_TOKEN=$(printf '%s' "$CF_TOKEN" | tr -d '\r' | tr -d '"' | tr -d "'")
           CF_TOKEN=$(printf '%s' "$CF_TOKEN" | xargs)
           if [ -z "$CF_TOKEN" ]; then
-            echo "::warning title=Cloudflare::CF_API_TOKEN is empty once whitespace/quotes are stripped - A record left alone, point it at $PUBLIC_IP by hand"
+            echo "::warning title=Cloudflare::CF_API_TOKEN is empty - DNS left alone"
             exit 0
           fi
 
-          # Two credential types exist and they use different headers: a Global
-          # API Key is exactly 37 hex characters and goes in X-Auth-Key with the
-          # account email, while a scoped API Token is a long base64-ish string
-          # sent as "Authorization: Bearer". Sending a Global key as Bearer is
-          # the classic 9106 "Authentication failed (status: 400)".
           if printf '%s' "$CF_TOKEN" | grep -Eq '^[0-9a-f]{37}$'; then
             if [ -z "$CF_EMAIL" ]; then
-              echo "::warning title=Cloudflare::CF_API_TOKEN is a Global API Key, which needs the account email in CF_API_EMAIL - add that secret, or create a scoped API Token (Zone -> DNS -> Edit); A record left alone, point it at $PUBLIC_IP by hand"
+              echo "::warning title=Cloudflare::Global API Key needs CF_API_EMAIL - DNS left alone"
               exit 0
             fi
             AUTH=(-H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_TOKEN")
-            echo "Cloudflare auth: Global API Key + CF_API_EMAIL"
           else
             AUTH=(-H "Authorization: Bearer $CF_TOKEN")
-            echo "Cloudflare auth: API Token (Bearer), length ${#CF_TOKEN}"
           fi
 
-          # vpn.example.com is not a zone, it is a record inside example.com, so
-          # the lookup tries the parent name as well - otherwise a perfectly
-          # valid token looks broken and every run warns about the zone.
           ZONE_ID=""
-          ZONE_NAME=""
-          ZONES=""
           ZONE_CANDIDATES="$DOMAIN"
           case "$DOMAIN" in
             *.*.*) ZONE_CANDIDATES="$ZONE_CANDIDATES ${DOMAIN#*.}" ;;
@@ -261,44 +196,30 @@ jobs:
             ZONE_ID=$(printf '%s' "$ZONES" | jq -r --arg d "$cand" \
               'if .success and (.result | length) > 0 then (.result[] | select(.name == $d) | .id) else empty end' | head -1)
             if [ -n "$ZONE_ID" ]; then
-              ZONE_NAME=$cand
-              echo "Zone $cand resolved through the API: $ZONE_ID (record: $DOMAIN)"
+              echo "Zone $cand resolved: $ZONE_ID"
               break
             fi
           done
           if [ -z "$ZONE_ID" ]; then
             ZONE_ID=$CF_ZONE
-            ZONE_NAME="zone from CF_ZONE_ID"
-            echo "::warning title=Cloudflare::no zone visible for [$ZONE_CANDIDATES] - falling back to CF_ZONE_ID"
-            echo "zone lookup response:"
-            printf '%s' "$ZONES" | head -c 400
-            echo
+            echo "::warning title=Cloudflare::falling back to CF_ZONE_ID"
           fi
           if [ -z "$ZONE_ID" ]; then
-            echo "::warning title=Cloudflare::no zone found for [$ZONE_CANDIDATES] and CF_ZONE_ID is empty - A record left alone, point $DOMAIN at $PUBLIC_IP by hand"
-            echo "zones visible to this credential (names/status only):"
-            printf '%s' "$ZONES" | jq -r '.result[]? | "  \(.name)  \(.status)"' | head -20
+            echo "::warning title=Cloudflare::no zone found - DNS left alone"
             exit 0
           fi
-          # Cloudflare's API matches the FQDN (the UI's "@"), and the body is
-          # kept (no -f) so a 404/403 prints the API's own reason, not curl's.
-          # Both the apex and www follow the runner IP, so either name works in
-          # a client (with V2RAY_DOMAIN on a subdomain the second name is
-          # www.<subdomain>).
+
+          # Grey cloud: proxied=false. Cloudflare Tunnel handles ingress.
           for NAME in "$DOMAIN" "www.$DOMAIN"; do
-            # Look up any record with this name (not just A): a CNAME with the
-            # same name blocks A-record creation (Cloudflare error 81054).
             GET_BODY=$(curl -sS "${AUTH[@]}" \
               "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$NAME&per_page=50")
             A_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success then (.result[] | select(.type=="A") | .id) else empty end' | head -1)
             CNAME_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success then (.result[] | select(.type=="CNAME") | .id) else empty end' | head -1)
-            # A CNAME and an A record cannot share a name, so remove the CNAME
-            # first, then create/update the A record.
             if [ -n "$CNAME_ID" ]; then
               curl -sS -X DELETE "${AUTH[@]}" \
                 "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$CNAME_ID" \
                 | jq -r '.success // empty' >/dev/null \
-                && echo "deleted conflicting CNAME record for $NAME" \
+                && echo "deleted conflicting CNAME for $NAME" \
                 || echo "::warning title=Cloudflare::could not delete CNAME for $NAME"
             fi
             if [ -n "$A_ID" ]; then
@@ -310,59 +231,20 @@ jobs:
             fi
             BODY=$(curl -sS -X "$METHOD" "${AUTH[@]}" \
               -H "Content-Type: application/json" "$URL" \
-              -d "{\"type\":\"A\",\"name\":\"$NAME\",\"content\":\"$PUBLIC_IP\",\"ttl\":300,\"proxied\":$PROXIED}")
+              -d "{\"type\":\"A\",\"name\":\"$NAME\",\"content\":\"$PUBLIC_IP\",\"ttl\":300,\"proxied\":false}")
             if printf '%s' "$BODY" | jq -e '.success' >/dev/null 2>&1; then
-              if [ "$METHOD" = PUT ]; then
-                echo "Cloudflare A record updated: $NAME -> $PUBLIC_IP (proxied=$PROXIED)"
-              else
-                echo "Cloudflare A record created: $NAME -> $PUBLIC_IP (proxied=$PROXIED)"
-              fi
+              echo "Cloudflare A record $METHOD: $NAME -> $PUBLIC_IP (grey cloud)"
             else
-              # DNS failure must not take the node down (or hide itself): the A
-              # record can be pointed at $PUBLIC_IP by hand, so warn loudly and
-              # say which of the three usual causes the error code points at.
-              echo "::warning title=Cloudflare::A record not updated for $NAME (HTTP body below)"
-              echo "method: $METHOD url: $URL"
+              echo "::warning title=Cloudflare::A record not updated for $NAME"
               printf '%s' "$BODY" | head -c 400
               echo
-              ERR=$(printf '%s' "$BODY" | jq -r '(.errors // [])[] | .code' 2>/dev/null | head -1)
-              case "$ERR" in
-                9106|10000)
-                  echo "hint: code $ERR = Cloudflare rejected the credential itself, not the zone. Re-copy CF_API_TOKEN with no quotes/spaces/newlines; if it is a 37-character Global API Key it also needs CF_API_EMAIL (sent as X-Auth-Key, not Bearer); if it was rolled, generate a new token." ;;
-                9107|9109)
-                  echo "hint: code $ERR = the credential is valid but not allowed here. Give the token Zone -> DNS -> Edit for $DOMAIN (and keep Zone -> Zone -> Read if you want the lookup to work)." ;;
-                7003)
-                  echo "hint: code $ERR = the zone id does not belong to this credential, so CF_ZONE_ID points at a zone this account cannot see." ;;
-                *)
-                  echo "hint: code $ERR - see https://developers.cloudflare.com/fundamentals/api/reference/errors/" ;;
-              esac
             fi
           done
-
-          # Propagation sanity check (best effort, never fails the step). It only
-          # means something on a grey-cloud record: an orange-cloud record
-          # answers with Cloudflare's anycast IPs, not with $PUBLIC_IP.
-          if [ "$PROXIED" = "true" ]; then
-            echo "skipping the DNS propagation check: proxied=true answers with Cloudflare IPs, not $PUBLIC_IP"
-          else
-            echo "Waiting ~5s for DNS to propagate..."
-            sleep 5
-            for NAME in "$DOMAIN" "www.$DOMAIN"; do
-              RESOLVED=$(dig +short "$NAME" A @1.1.1.1 2>/dev/null | head -1 || true)
-              if [ "$RESOLVED" = "$PUBLIC_IP" ]; then
-                echo "DNS verified: $NAME resolves to $PUBLIC_IP"
-              else
-                echo "::notice title=Cloudflare::DNS not yet verified for $NAME (got $RESOLVED, expected $PUBLIC_IP) - may still be propagating"
-              fi
-            done
-          fi
 
       - name: Install v2ray
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
         run: |
-          # Install v2ray (official script)
           curl -fsSL https://github.com/v2fly/fhs-install-v2ray/raw/master/install-release.sh | sudo bash
-          # Verify - v2ray uses subcommands ("v2ray version"), not -version flags
           /usr/local/bin/v2ray version
 
       - name: Generate v2ray config
@@ -372,18 +254,12 @@ jobs:
           UUID: ${{ secrets.V2RAY_UUID }}
           PORT: ${{ env.V2RAY_PORT }}
           WS_PATH: ${{ env.V2RAY_WS_PATH }}
-          PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
         run: |
-          # A pasted secret often carries stray quotes, whitespace or upper
-          # case; v2ray needs the canonical lowercase UUID, and otherwise fails
-          # late inside the broker with "invalid UUID".
           RAW="$UUID"
           UUID=$(printf '%s' "$RAW" | tr -d '\r' | tr -d '"' | tr -d "'" | tr 'A-Z' 'a-z')
           UUID=$(printf '%s' "$UUID" | xargs)
           if ! printf '%s' "$UUID" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
-            echo "::error title=v2ray::V2RAY_UUID is not a UUID - set the secret to 8-4-4-4-12 hex digits"
-            printf '  raw length: %s, normalized length: %s\n' "${#RAW}" "${#UUID}"
-            echo "  (check for surrounding quotes/spaces/newlines in the secret value)"
+            echo "::error title=v2ray::V2RAY_UUID is not a UUID"
             exit 1
           fi
           cat > /tmp/config.json <<EOF
@@ -391,52 +267,32 @@ jobs:
             "inbounds": [
               {
                 "port": ${PORT},
+                "listen": "127.0.0.1",
                 "protocol": "vmess",
                 "settings": {
-                  "clients": [
-                    {
-                      "id": "${UUID}",
-                      "alterId": 0
-                    }
-                  ]
+                  "clients": [{"id": "${UUID}", "alterId": 0}]
                 },
                 "streamSettings": {
                   "network": "ws",
                   "wsSettings": {
                     "path": "${WS_PATH}",
-                    "headers": {
-                      "Host": "${DOMAIN}"
-                    }
+                    "headers": {"Host": "${DOMAIN}"}
                   }
-                },
-                "sniffing": {
-                  "enabled": true,
-                  "destOverride": ["http", "tls"]
                 }
               }
             ],
-            "outbounds": [
-              {
-                "protocol": "freedom",
-                "settings": {}
-              }
-            ],
-            "dns": {
-              "servers": ["https+local://1.1.1.1/dns-query", "8.8.8.8", "localhost"]
-            }
+            "outbounds": [{"protocol": "freedom", "settings": {}}],
+            "dns": {"servers": ["https+local://1.1.1.1/dns-query", "8.8.8.8", "localhost"]}
           }
           EOF
           sudo mkdir -p /usr/local/etc/v2ray
           sudo cp /tmp/config.json /usr/local/etc/v2ray/config.json
-          # Validate before anything tries to run it
           /usr/local/bin/v2ray test -config /usr/local/etc/v2ray/config.json
-          echo "v2ray config written to /usr/local/etc/v2ray/config.json"
-          echo "v2ray listens on port ${PORT} (Cloudflare proxies 443/TLS -> ${PORT} when CF_PROXIED=true)"
+          echo "v2ray config written (listening on 127.0.0.1:${PORT}, cloudflared forwards to it)"
 
       - name: Start v2ray
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
         run: |
-          # Run v2ray in background, supervised
           cat > "$HOME/run-v2ray.sh" <<'SH'
           #!/usr/bin/env bash
           while true; do
@@ -448,10 +304,8 @@ jobs:
           chmod +x "$HOME/run-v2ray.sh"
           setsid nohup "$HOME/run-v2ray.sh" >/dev/null 2>&1 &
           echo $! > "$HOME/v2ray.pid"
-          echo "v2ray supervisor pid $(cat "$HOME/v2ray.pid")"
-          # Wait for startup
           for i in $(seq 1 20); do
-            if curl -fsS "http://127.0.0.1:${V2RAY_PORT}" >/dev/null 2>&1 || ss -ltn | grep -q ":${V2RAY_PORT} "; then
+            if ss -ltn | grep -q ":${V2RAY_PORT} "; then
               echo "v2ray is listening on port ${V2RAY_PORT}"
               break
             fi
@@ -459,38 +313,111 @@ jobs:
           done
           tail -20 "$HOME/v2ray.log" || true
 
+      # ---------------------------------------------------------------- Cloudflare Tunnel
+      # Public ingress: runner dials OUT to Cloudflare over QUIC/HTTPS.
+      # Cloudflare forwards client WebSocket connections to localhost:8080.
+      # Works from any GitHub Actions runner with zero inbound ports.
+      - name: Start Cloudflare Tunnel (v2ray public entry point)
+        if: env.V2RAY_MODE != 'tunnel' && env.V2RAY_DOMAIN != '' && env.CF_TUNNEL_ID != '' && env.CF_ACCOUNT_ID != '' && env.CF_API_TOKEN != ''
+        env:
+          DOMAIN: ${{ vars.V2RAY_DOMAIN }}
+          CF_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          TUNNEL_ID: ${{ secrets.CF_TUNNEL_ID }}
+          WS_PATH: ${{ env.V2RAY_WS_PATH }}
+          PORT: ${{ env.V2RAY_PORT }}
+        run: |
+          CF_TOKEN=$(printf '%s' "$CF_TOKEN" | tr -d '\r' | tr -d '"' | tr -d "'" | xargs)
+          if [ -z "$CF_TOKEN" ] || [ -z "$ACCOUNT_ID" ] || [ -z "$TUNNEL_ID" ]; then
+            echo "::warning title=Cloudflare::CF_API_TOKEN, CF_ACCOUNT_ID, or CF_TUNNEL_ID missing - tunnel skipped"
+            exit 0
+          fi
+
+          curl -fsSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
+
+          # Fetch tunnel token from Cloudflare API
+          TOKEN_BODY=$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/token")
+          TUNNEL_TOKEN=$(printf '%s' "$TOKEN_BODY" | jq -r '.result // empty')
+          if [ -z "$TUNNEL_TOKEN" ] || [ "$TUNNEL_TOKEN" = "null" ]; then
+            echo "::error title=Cloudflare::could not read tunnel token (needs Account -> Cloudflare Tunnel -> Edit)"
+            exit 1
+          fi
+          printf '%s' "$TUNNEL_TOKEN" > "$HOME/.cloudflared-tunnel-token"
+          chmod 600 "$HOME/.cloudflared-tunnel-token"
+
+          # Write ingress config to Cloudflare API (hostname + WS path -> localhost:PORT)
+          INGRESS=$(cat <<EOJ
+          {
+            "config": {
+              "ingress": [
+                {"hostname": "$DOMAIN", "path": "$WS_PATH", "service": "http://localhost:$PORT"},
+                {"service": "http_status:404"}
+              ],
+              "warp-routing": {"enabled": false}
+            }
+          }
+          EOJ
+          )
+          CFG_BODY=$(curl -sS -X PUT -H "Authorization: Bearer $CF_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
+            -d "$INGRESS")
+          if printf '%s' "$CFG_BODY" | jq -e '.success' >/dev/null 2>&1; then
+            echo "tunnel ingress: $DOMAIN$WS_PATH -> http://localhost:$PORT"
+          else
+            echo "::warning title=Cloudflare::could not update tunnel ingress - set it manually in the dashboard"
+          fi
+
+          # Supervised cloudflared
+          cat > "$HOME/run-cloudflared.sh" <<'SH'
+          #!/usr/bin/env bash
+          while true; do
+            /usr/local/bin/cloudflared tunnel --no-autoupdate \
+              run --token "$(cat "$HOME/.cloudflared-tunnel-token")" \
+              >> "$HOME/cloudflared.log" 2>&1
+            echo "[$(date -u +%FT%TZ)] cloudflared exited ($?) - restart in 10s" >> "$HOME/cloudflared.log"
+            sleep 10
+          done
+          SH
+          chmod +x "$HOME/run-cloudflared.sh"
+          setsid nohup "$HOME/run-cloudflared.sh" >/dev/null 2>&1 &
+          echo $! > "$HOME/cloudflared.pid"
+
+          connected=0
+          for i in $(seq 1 60); do
+            if grep -q "Registered tunnel connection" "$HOME/cloudflared.log" 2>/dev/null; then
+              connected=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$connected" = 1 ]; then
+            echo "cloudflared connected to Cloudflare Tunnel"
+          else
+            echo "::warning title=Cloudflare::cloudflared did not register within 120s"
+          fi
+          tail -20 "$HOME/cloudflared.log" || true
+
       - name: Publish v2ray connection info
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
         env:
-          DOMAIN: ${{ env.V2RAY_DOMAIN }}
+          DOMAIN: ${{ vars.V2RAY_DOMAIN }}
           UUID: ${{ secrets.V2RAY_UUID }}
           PORT: ${{ env.V2RAY_PORT }}
           WS_PATH: ${{ env.V2RAY_WS_PATH }}
           PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
           NODE_IP: ${{ env.NODE_IP }}
-          PROXIED: ${{ env.CF_PROXIED }}
         run: |
-          # When CF_PROXIED=true the client talks TLS to Cloudflare on 443 and
-          # Cloudflare forwards it to v2ray over plain HTTP on the runner,
-          # so the client-side link is 443/tls even though v2ray itself listens
-          # on ${PORT} without TLS. When CF_PROXIED=false the client talks
-          # straight to the runner, so the link is ${PORT}/none.
-          if [ "$PROXIED" = "true" ]; then
-            CLIENT_PORT=443
-            CLIENT_TLS=tls
-            CLIENT_SNI="$DOMAIN"
-            CLIENT_HOST="$DOMAIN"
-            CLIENT_NOTE="ws over TLS on 443 via Cloudflare (v2ray listens on ${PORT} on the runner)"
-          else
-            CLIENT_PORT="$PORT"
-            CLIENT_TLS=""
-            CLIENT_SNI="$DOMAIN"
-            CLIENT_HOST="$DOMAIN"
-            CLIENT_NOTE="ws, no TLS (direct to runner IP on ${PORT})"
-          fi
+          # Client connects to Cloudflare on 443/TLS -> Cloudflare Tunnel -> v2ray on localhost:8080.
+          CLIENT_PORT=443
+          CLIENT_TLS=tls
+          CLIENT_SNI="$DOMAIN"
+          CLIENT_HOST="$DOMAIN"
+          CLIENT_NOTE="ws over TLS on 443 via Cloudflare Tunnel (v2ray on 127.0.0.1:8080)"
 
-          # Built once, shown three times: masked-safe plain text in this step's
-          # log, unmodified in the artifact file, and in the run summary.
           VMESS_JSON=$(cat <<EOJ
           {
             "v": "2",
@@ -514,56 +441,38 @@ jobs:
 
           echo "================ v2ray connection info ================"
           echo "domain       : $DOMAIN"
-          echo "mode         : proxied=$PROXIED"
-          echo "public IP    : $PUBLIC_IP   (the A record must point here)"
-          echo "tailscale IP : $NODE_IP"
-          echo "port         : $CLIENT_PORT/tcp  (client side)"
+          echo "port         : $CLIENT_PORT/tcp (via Cloudflare Tunnel)"
           echo "uuid         : $UUID"
           echo "ws path      : $WS_PATH"
-          echo "network      : ws | security: $CLIENT_TLS"
-          echo ""
-          echo "The vmess:// link is deliberately not printed here: it carries the"
-          echo "UUID, so GitHub masks part of it and the base64 copy becomes"
-          echo "unusable (it decodes to \"id\": \"***\"). Take the link from"
-          echo "  - this run's Summary page, or"
-          echo "  - the 'v2ray-connection' artifact of this run (plain text)"
+          echo "network      : ws | security: tls"
           echo "======================================================"
 
           CONN_FILE="$RUNNER_TEMP/v2ray-connection.txt"
           {
             echo "v2ray connection info"
             echo "domain       : $DOMAIN"
-            echo "mode         : proxied=$PROXIED"
-            echo "public IP    : $PUBLIC_IP   (the A record must point here)"
-            echo "tailscale IP : $NODE_IP"
-            echo "port         : $CLIENT_PORT/tcp  (client side)"
+            echo "port         : $CLIENT_PORT/tcp (via Cloudflare Tunnel)"
             echo "uuid         : $UUID"
             echo "ws path      : $WS_PATH"
-            echo "network      : ws | security: $CLIENT_TLS"
+            echo "network      : ws | security: tls"
             echo ""
-            echo "vmess link (import into V2RayN / v2rayNG / Clash):"
+            echo "vmess link:"
             echo "$VMESS_LINK"
           } > "$CONN_FILE"
-          echo "wrote $CONN_FILE (the same link is on the run Summary page)"
 
           {
             echo "### v2ray (VMess + WebSocket) is up"
             echo ""
-            echo "**Public IP:** \`$PUBLIC_IP\`"
-            echo "**Tailscale IP:** \`$NODE_IP\`"
-            echo "**Domain:** \`$DOMAIN\` (A record auto-updated to \`$PUBLIC_IP\` every run)"
-            echo "**Port:** \`$CLIENT_PORT\`"
+            echo "**Domain:** \`$DOMAIN\`"
+            echo "**Port:** \`$CLIENT_PORT\` (Cloudflare Tunnel -> localhost:${PORT})"
             echo "**UUID:** \`$UUID\`"
             echo "**WebSocket Path:** \`$WS_PATH\`"
-            echo "**Network:** ws"
-            echo "**Security:** \`$CLIENT_TLS\`"
+            echo "**Security:** tls"
             echo ""
             echo "> $CLIENT_NOTE"
             echo ""
-            echo "#### VMess link (for V2RayN, v2rayNG, Clash, etc.)"
+            echo "#### VMess link"
             echo "\`$VMESS_LINK\`"
-            echo ""
-            echo "> **Note:** The runner IP changes every run. The Cloudflare A record for \`$DOMAIN\` (and www) is auto-updated to \`$PUBLIC_IP\` at the start of each run."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload v2ray connection info
@@ -576,9 +485,6 @@ jobs:
           if-no-files-found: warn
 
       # ---------------------------------------------------------------- Restore
-      # One clone restores both apps. Each piece is optional: a missing zip
-      # simply means that app starts from scratch.
-
       - name: Restore state from backup
         id: restore
         run: |
@@ -589,46 +495,19 @@ jobs:
           work="$(mktemp -d)"
           if ! git clone --quiet --depth 1 \
               "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git" "$work"; then
-            echo "No readable backup repo (missing, empty or private) - fresh start"
+            echo "No readable backup repo - fresh start"
             rm -rf "$work"
             exit 0
           fi
           if [ -f "$work/hermes-state.zip" ]; then
             cp "$work/hermes-state.zip" "$HOME/hermes-restore.zip"
             echo "RESTORE_ZIP=$HOME/hermes-restore.zip" >> "$GITHUB_ENV"
-            echo "found Hermes backup"
-          else
-            echo "no Hermes backup - fresh start"
           fi
           if [ -f "$work/omniroute-state.zip" ]; then
             unzip -oq "$work/omniroute-state.zip" -d "$HOME"
             chmod 600 "$HOME/.omniroute/.env" 2>/dev/null || true
-            echo "restored OmniRoute state"
-          else
-            echo "no OmniRoute backup - fresh start"
           fi
           rm -rf "$work"
-
-      # --------------------------------------------------------- Hermes caches
-      # Hermes' heavy install artifacts: pm's tool store (the pinned uv 0.13.5,
-      # the pinned Python, and the tool binaries `hermes pm` published), the uv
-      # wheel cache the venv sync pulls from, and the install state under
-      # ~/.hermes/installs (facts.json naming the selected generation, plus that
-      # generation's venv and its resolved workspace). A warm cache is why a
-      # repeat run skips the venv sync entirely: pm stamps the sync against
-      # uv.lock + pyproject layout + extras + the pinned Python, so when the stamp
-      # in facts.json still matches and the venv it names is present, the sync is
-      # a no-op instead of a rebuild.
-
-      # All three paths MUST stay in this one cache entry: pm builds each
-      # generation's venv against the interpreter in ~/.hermes/tools and records
-      # absolute paths (into ~/.hermes/tools and ~/.hermes/installs), so a venv
-      # restored without its pinned tool store would not run, and the recorded
-      # generation path has to match where it was restored.
-
-      # The key is versioned: the venv generation only describes itself once
-      # built, so if the key changes the sync re-runs - which is correct, since a
-      # new lock/extras/python pin may require it.
 
       - name: Cache Hermes runtime
         uses: actions/cache@v4
@@ -640,11 +519,6 @@ jobs:
           key: hermes-${{ runner.os }}-tools-v1
           restore-keys: |
             hermes-${{ runner.os }}-tools-
-
-      # -------------------------------------------------------------- OmniRoute
-      # OmniRoute needs a modern Node (engines: >=22.22.2 <23 || >=24 <27) and
-      # is large (~915 MB unpacked), so its install prefix and npm cache are
-      # restored from Actions cache instead of being rebuilt on every run.
 
       - name: Set up Node.js for OmniRoute
         uses: actions/setup-node@v4
@@ -660,7 +534,6 @@ jobs:
             npm-${{ runner.os }}-node24-
 
       - name: Cache OmniRoute install
-        # Exact key, no restore-keys: a version bump must not reuse an old install.
         uses: actions/cache@v4
         with:
           path: ~/omniroute-app
@@ -670,7 +543,7 @@ jobs:
         run: |
           bin="$HOME/omniroute-app/node_modules/.bin/omniroute"
           if [ -x "$bin" ]; then
-            echo "OmniRoute ${OMNIROUTE_VERSION} restored from cache"
+            echo "OmniRoute restored from cache"
           else
             npm install --prefix "$HOME/omniroute-app" --no-audit --no-fund \
               "omniroute@${OMNIROUTE_VERSION}"
@@ -678,33 +551,23 @@ jobs:
           "$bin" --version || true
 
       - name: Set OmniRoute admin password
-        # The dashboard password lives in <DATA_DIR>/storage.sqlite, and a state
-        # restore brings back whatever password the previous run set - so there
-        # is no "default" left to log in with. `omniroute reset-password` is
-        # the only way to change it, and it writes the DB directly, so it goes
-        # after install (the CLI ships inside the package) and before the first
-        # start, while the database is quiesced.
         continue-on-error: true
         env:
           OMNIROUTE_PASSWORD: ${{ secrets.OMNIROUTE_PASSWORD }}
         run: |
           bin="$HOME/omniroute-app/node_modules/.bin/omniroute-reset-password"
           if [ -z "$OMNIROUTE_PASSWORD" ]; then
-            echo "OMNIROUTE_PASSWORD secret not set - keeping the password in the restored state"
+            echo "OMNIROUTE_PASSWORD not set - keeping restored password"
             exit 0
           fi
           if [ ! -x "$bin" ]; then
-            echo "::warning title=OmniRoute::omniroute-reset-password not in the install - password unchanged"
+            echo "::warning title=OmniRoute::reset-password binary not found"
             exit 0
           fi
           export DATA_DIR="$HOME/.omniroute"
-          # --password-stdin reads the whole stream as the new password (min 8
-          # chars, no confirmation), so the value is never echoed or logged.
           if printf '%s' "$OMNIROUTE_PASSWORD" | "$bin" --password-stdin; then
             echo "OmniRoute admin password applied"
           else
-            # Fresh install with no storage.sqlite yet: the app creates the DB on
-            # first start, so the next run (state on disk) applies the password.
             echo "::warning title=OmniRoute::password reset failed (no database yet?)"
           fi
 
@@ -713,11 +576,6 @@ jobs:
           mkdir -p "$HOME/.omniroute" "$HOME/omniroute-logs"
           export DATA_DIR="$HOME/.omniroute"
           export PORT="$OMNIROUTE_PORT"
-          export DASHBOARD_PORT="$OMNIROUTE_PORT"
-          export API_PORT="$OMNIROUTE_PORT"
-          # The runner also has a public IP. Bind only the tailnet address so the
-          # dashboard/API is reachable over Tailscale and nowhere else. OmniRoute's
-          # own readiness probe only checks loopback, so probe $NODE_IP below.
           export OMNIROUTE_SERVER_HOST="$NODE_IP"
           export REQUIRE_API_KEY=true
           export OMNIROUTE_NO_UPDATE_NOTIFIER=1
@@ -736,7 +594,6 @@ jobs:
           chmod +x "$HOME/run-omniroute.sh"
           setsid nohup "$HOME/run-omniroute.sh" >/dev/null 2>&1 &
           echo $! > "$HOME/omniroute.pid"
-          echo "omniroute supervisor pid $(cat "$HOME/omniroute.pid")"
           healthy=0
           for i in $(seq 1 90); do
             if curl -fsS "http://$NODE_IP:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1; then
@@ -746,17 +603,12 @@ jobs:
             sleep 2
           done
           if [ "$healthy" = 1 ]; then
-            echo "OmniRoute is healthy on http://$NODE_IP:${OMNIROUTE_PORT}"
+            echo "OmniRoute is healthy"
           else
-            echo "::warning title=OmniRoute::not healthy after 180s - see the log below"
+            echo "::warning title=OmniRoute::not healthy after 180s"
           fi
-          tail -40 "$HOME/omniroute-logs/omniroute.log" || true
 
       # ---------------------------------------------------------------- Hermes
-      # Every step here is self-contained and skips itself when a secret is
-      # missing, so an unconfigured backup repo or a failed Hermes install can
-      # never take the exit node down with it.
-
       - name: Install Hermes Agent
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
@@ -773,58 +625,39 @@ jobs:
       - name: Configure Hermes
         run: |
           mkdir -p "$HOME/.hermes"
-          # Keep any keys the restored .env already has; only add/update ours.
           touch "$HOME/.hermes/.env"
-          upsert() { # key, value
+          upsert() {
             if grep -q "^$1=" "$HOME/.hermes/.env"; then
               sed -i "s|^$1=.*|$1=$2|" "$HOME/.hermes/.env"
             else
               printf '%s=%s\n' "$1" "$2" >> "$HOME/.hermes/.env"
             fi
           }
-          # OmniRoute first: it is the OpenAI-compatible endpoint the agent should
-          # be talking to when the secret is set.
           if [ -n "$OMNIROUTE_API_KEY" ]; then
-            # Hermes' provider stays "nvidia" - it already speaks the
-            # OpenAI-compatible wire format, so an OpenAI-compatible endpoint
-            # needs nothing more than a different base URL and key. The URL must
-            # use the tailnet IP: OmniRoute binds $NODE_IP only (see
-            # OMNIROUTE_SERVER_HOST in "Start OmniRoute"), localhost is refused,
-            # and MagicDNS is not resolvable on the runner itself because this
-            # node joins with --accept-dns=false.
             upsert NVIDIA_BASE_URL   "http://$NODE_IP:${OMNIROUTE_PORT}/v1"
             upsert NVIDIA_API_KEY    "$OMNIROUTE_API_KEY"
             ~/.local/bin/hermes config set model.provider nvidia
             ~/.local/bin/hermes config set model.default  "$OMNIROUTE_MODEL"
-            echo "Hermes model -> $OMNIROUTE_MODEL via http://$NODE_IP:${OMNIROUTE_PORT}/v1"
           elif [ -n "$NVIDIA_API_KEY" ]; then
             upsert NVIDIA_API_KEY    "$NVIDIA_API_KEY"
             upsert NVIDIA_BASE_URL   "$NVIDIA_BASE_URL"
             ~/.local/bin/hermes config set model.provider nvidia
             ~/.local/bin/hermes config set model.default  "$HERMES_MODEL"
-          else
-            echo "::warning title=Hermes::neither OMNIROUTE_API_KEY nor NVIDIA_API_KEY is set - model left as restored"
           fi
           if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
             upsert TELEGRAM_BOT_TOKEN     "$TELEGRAM_BOT_TOKEN"
             upsert TELEGRAM_ALLOWED_USERS "$TELEGRAM_USER_ID"
-          else
-            echo "::warning title=Hermes::TELEGRAM_BOT_TOKEN secret not set - Telegram bridge off"
           fi
           chmod 600 "$HOME/.hermes/.env"
           ~/.local/bin/hermes config check || true
 
       - name: Start Hermes gateway
         run: |
-          # Foreground `gateway run` is what a headless host wants, so supervise it
-          # ourselves: no systemd in the runner image, and no supervisor means no
-          # second copy fighting the first one over the bot token.
           cat > "$HOME/run-hermes-gateway.sh" <<'SH'
           #!/usr/bin/env bash
           while true; do
             "$HOME/.local/bin/hermes" gateway run --replace >> "$HOME/.hermes/logs/gateway.log" 2>&1
-            echo "[$(date -u +%FT%TZ)] gateway exited ($?) - restart in ${HERMES_RESTART_DELAY}s" \
-              >> "$HOME/.hermes/logs/gateway.log"
+            echo "[$(date -u +%FT%TZ)] gateway exited ($?) - restart in ${HERMES_RESTART_DELAY}s" >> "$HOME/.hermes/logs/gateway.log"
             sleep "$HERMES_RESTART_DELAY"
           done
           SH
@@ -832,12 +665,10 @@ jobs:
           mkdir -p "$HOME/.hermes/logs"
           setsid nohup "$HOME/run-hermes-gateway.sh" >/dev/null 2>&1 &
           echo $! > "$HOME/hermes-gateway.pid"
-          echo "gateway supervisor pid $(cat "$HOME/hermes-gateway.pid")"
           for i in $(seq 1 60); do
             grep -q . "$HOME/.hermes/logs/gateway.log" 2>/dev/null && break
             sleep 1
           done
-          tail -40 "$HOME/.hermes/logs/gateway.log" || true
 
       - name: Publish address
         run: |
@@ -846,27 +677,21 @@ jobs:
             echo ""
             echo "Tailnet address: \`$NODE_IP\`"
             echo "MagicDNS name:  \`$NODE_NAME\`"
-            echo "Exit node: enabled, auto-approved with \`$EXIT_TAG\` (no manual approval needed)"
+            echo "Exit node: enabled with \`$EXIT_TAG\`"
             echo "SSH: \`tailscale ssh runner@$NODE_NAME\`"
             echo ""
-            echo "OmniRoute dashboard: http://$NODE_NAME:$OMNIROUTE_PORT  _(MagicDNS, tailnet only)_"
-            echo ""
             echo "OmniRoute dashboard: http://$NODE_IP:$OMNIROUTE_PORT  _(tailnet only)_"
-            echo ""
-            echo "> OmniRoute listens on the Tailscale interface only; it is **not** on the public internet."
-            echo "> Hermes talks to you on Telegram and exposes no inbound port."
+            echo "> v2ray is reachable via Cloudflare Tunnel at $DOMAIN:443"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep alive
         run: |
-          # Stop ~5 min before the job deadline: the backup and the post-job
-          # cache saves (Hermes runtime, npm, OmniRoute install) still have to run,
-          # and the hard timeout would otherwise kill this shell mid-step.
           END=$((SECONDS + RUN_MINUTES * 60 - 300))
           while [ $SECONDS -lt $END ]; do
             tailscale status >/dev/null 2>&1 || echo "tailscaled hiccup"
             omni=$(curl -fsS "http://$NODE_IP:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1 && echo ok || echo down)
-            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | hermes $(wc -l < "$HOME/.hermes/logs/gateway.log" 2>/dev/null || echo 0) log lines | omniroute $omni"
+            cf=$(grep -c "Registered tunnel connection" "$HOME/cloudflared.log" 2>/dev/null || echo 0)
+            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | omniroute $omni | cloudflared conns=$cf"
             sleep 60
           done
 
@@ -874,33 +699,35 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          # Never copy a live state.db: quiesce the agent before snapshotting it.
           ~/.local/bin/hermes gateway stop --yes --all >> "$HOME/.hermes/logs/gateway.log" 2>&1 || true
-          # Kill the supervisor and its whole process group first, then anything
-          # still holding the gateway open, so no second copy can grab the token.
           if [ -f "$HOME/hermes-gateway.pid" ]; then
             kill -- -"$(cat "$HOME/hermes-gateway.pid")" 2>/dev/null || true
             kill "$(cat "$HOME/hermes-gateway.pid")" 2>/dev/null || true
           fi
           pkill -f 'run-hermes-gateway.sh' 2>/dev/null || true
           pkill -f 'hermes gateway run' 2>/dev/null || true
-          sleep 2
-          echo "gateway stopped"
 
       - name: Stop OmniRoute
         if: always()
         continue-on-error: true
         run: |
-          # Kill the supervisor's whole process group first, otherwise its
-          # restart loop brings `serve` back while the DB is being zipped.
           if [ -f "$HOME/omniroute.pid" ]; then
             kill -- -"$(cat "$HOME/omniroute.pid")" 2>/dev/null || true
             kill "$(cat "$HOME/omniroute.pid")" 2>/dev/null || true
           fi
           pkill -f 'run-omniroute.sh' 2>/dev/null || true
           pkill -f 'omniroute.*serve' 2>/dev/null || true
-          sleep 3
-          echo "omniroute stopped"
+
+      - name: Stop cloudflared
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f "$HOME/cloudflared.pid" ]; then
+            kill -- -"$(cat "$HOME/cloudflared.pid")" 2>/dev/null || true
+            kill "$(cat "$HOME/cloudflared.pid")" 2>/dev/null || true
+          fi
+          pkill -f 'run-cloudflared.sh' 2>/dev/null || true
+          pkill -f 'cloudflared tunnel' 2>/dev/null || true
 
       - name: Back up state to GitHub
         if: always()
@@ -914,35 +741,26 @@ jobs:
           out="$RUNNER_TEMP/state-out"
           rm -rf "$out"; mkdir -p "$out"
           ok=1
-
-          # Hermes keeps its own archive format, restorable with `hermes import`.
           if [ -x "$HOME/.local/bin/hermes" ]; then
             if ! ~/.local/bin/hermes backup -o "$out/hermes-state.zip"; then
               echo "::warning title=Backup::hermes backup failed"
               ok=0
             fi
           fi
-
-          # OmniRoute: the sqlite DB and its .env (STORAGE_ENCRYPTION_KEY) only
-          # make sense together, and the app is already stopped above.
           if [ -x "$HOME/omniroute-app/node_modules/.bin/omniroute" ] && [ -d "$HOME/.omniroute" ]; then
             if ! ( cd "$HOME" && zip -qr "$out/omniroute-state.zip" .omniroute -x '.omniroute/logs/*' ); then
               echo "::warning title=Backup::omniroute backup failed"
               ok=0
             fi
           fi
-
           if [ ! -f "$out/hermes-state.zip" ] && [ ! -f "$out/omniroute-state.zip" ]; then
-            echo "no state captured - leaving the existing backup untouched"
+            echo "no state captured - leaving existing backup untouched"
             exit 0
           fi
           if [ "$ok" != 1 ]; then
-            echo "::warning title=Backup::a snapshot failed - keeping the previous backup to avoid data loss"
+            echo "::warning title=Backup::snapshot failed - keeping previous backup"
             exit 0
           fi
-
-          # Update the existing repo instead of wiping it, so a run that cannot
-          # snapshot one app never deletes the other app's last good backup.
           branch=$(curl -fsSL -H "Authorization: Bearer ${HERMES_BACKUP_TOKEN}" \
             "https://api.github.com/repos/${HERMES_BACKUP_REPO}" \
             | jq -r '.default_branch // empty')
@@ -969,22 +787,12 @@ jobs:
               done
           echo "state (${stamp}) pushed to ${HERMES_BACKUP_REPO}"
 
-      # ------------------------------------------------- prune stale Hermes
-      # pm never deletes a venv generation it built until it has gone unselected
-      # for 24h with no live lease (collect_generations), so a cache that carries
-      # ~/.hermes/installs would otherwise grow one whole generation per lock
-      # bump. facts.json names the generation pm actually selected, so keeping
-      # that one and dropping its siblings is the same rule pm applies - just
-      # now, while the runner is about to hand the tree back to the cache.
-      # Must run before the job's post cache save to have any effect.
-
       - name: Prune superseded Hermes environments
         if: always()
         continue-on-error: true
         run: |
           root="$HOME/.hermes/installs"
           [ -d "$root" ] || exit 0
-          before=$(du -sh "$root" 2>/dev/null | cut -f1)
           python3 - "$root" <<'PY'
           import json, shutil, sys
           from pathlib import Path
@@ -993,20 +801,16 @@ jobs:
                   data = json.loads(facts.read_text(encoding="utf-8-sig"))
                   selected = Path(data["packages"]["venv"]["environment"]).resolve()
               except Exception:
-                  continue  # no published selection yet: nothing is provably stale
+                  continue
               if not selected.is_dir():
-                  continue  # the cache lost what pm selected; keep the rest as evidence
+                  continue
               generation = selected.parent
-              if generation.parent.name != "environments" \
-                  or generation.parent.parent != facts.parent.resolve():
-                  continue  # the recording is from another machine or another layout
+              if generation.parent.name != "environments" or generation.parent.parent != facts.parent.resolve():
+                  continue
               for sibling in sorted(generation.parent.iterdir()):
                   if sibling.is_dir() and sibling.resolve() != generation:
-                      print(f"removing superseded generation {sibling}")
                       shutil.rmtree(sibling, ignore_errors=True)
           PY
-          after=$(du -sh "$root" 2>/dev/null | cut -f1)
-          echo "hermes installs: ${before:-0} -> ${after:-0}"
 
       - name: Leave tailnet
         if: always()
