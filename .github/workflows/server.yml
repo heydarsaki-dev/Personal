@@ -45,6 +45,14 @@ jobs:
       HERMES_MODEL: minimaxai/minimax-m3.1-flash
       NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
       HERMES_RESTART_DELAY: 10
+      # Hermes via OmniRoute: set the OMNIROUTE_API_KEY secret and "Configure
+      # Hermes" points the agent at OmniRoute instead of at NVIDIA directly.
+      # Leave it unset and the NVIDIA branch in that step keeps driving Hermes,
+      # so nothing changes until you explicitly switch.
+      OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
+      # The combo name as configured in the OmniRoute dashboard. Hermes asks for
+      # it verbatim as model.default, so it must match the combo exactly.
+      OMNIROUTE_MODEL: ${{ vars.OMNIROUTE_MODEL || 'MyCombo' }}
       # OmniRoute — pinned so the cache key and native module ABI stay stable
       OMNIROUTE_VERSION: "3.8.53"
       OMNIROUTE_PORT: "20128"
@@ -74,11 +82,11 @@ jobs:
                           -d "grant_type=client_credentials" \
                           https://api.tailscale.com/api/v2/oauth/token \
                   | jq -r '.access_token')
-          curl -fsSL -H "Authorization: Bearer ***" \
+          curl -fsSL -H "Authorization: Bearer $token" \
             "https://api.tailscale.com/api/v2/tailnet/$TS_TAILNET/devices" \
             | jq -r --arg name "$NODE_NAME" '.devices[]? | select(.hostname == $name) | .id' \
             | while read -r id; do
-                curl -fsSL -X DELETE -H "Authorization: Bearer ***" \
+                curl -fsSL -X DELETE -H "Authorization: Bearer $token" \
                   "https://api.tailscale.com/api/v2/device/$id"
                 echo "removed stale node $id"
               done
@@ -121,9 +129,16 @@ jobs:
       # the runner's public IP changes. The domain's A record MUST be updated
       # to the new public IP each run. NicNames API does NOT support DNS record
       # management (only domain registration). Options:
-      #   1. Manual: Copy the IP from workflow summary → NicNames DNS panel
+      #   1. Manual: Copy the IP from workflow summary -> NicNames DNS panel
       #   2. Cloudflare (recommended): Add domain to Cloudflare, set NS at NicNames
       #      to Cloudflare's, add CF_API_TOKEN + CF_ZONE_ID secrets for auto-update.
+
+      # NOTE ON INDENTATION: every line of a heredoc body below is indented to
+      # this step's block level (10 spaces) or deeper, and each terminator (EOF,
+      # EOJ, SH) sits at exactly 10. YAML strips that 10-space block indent, so
+      # the shell still receives the terminators at column 0, where a plain
+      # <<EOF heredoc requires them. A JSON line left at column 0 would end the
+      # run: | block scalar and break the whole workflow file.
 
       - name: Get public IP
         id: public-ip
@@ -176,45 +191,45 @@ jobs:
           PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
         run: |
           cat > /tmp/config.json <<EOF
-{
-  "inbounds": [
-    {
-      "port": ${PORT},
-      "protocol": "vmess",
-      "settings": {
-        "clients": [
           {
-            "id": "${UUID}",
-            "alterId": 0
+            "inbounds": [
+              {
+                "port": ${PORT},
+                "protocol": "vmess",
+                "settings": {
+                  "clients": [
+                    {
+                      "id": "${UUID}",
+                      "alterId": 0
+                    }
+                  ]
+                },
+                "streamSettings": {
+                  "network": "ws",
+                  "wsSettings": {
+                    "path": "${WS_PATH}",
+                    "headers": {
+                      "Host": "${DOMAIN}"
+                    }
+                  }
+                },
+                "sniffing": {
+                  "enabled": true,
+                  "destOverride": ["http", "tls"]
+                }
+              }
+            ],
+            "outbounds": [
+              {
+                "protocol": "freedom",
+                "settings": {}
+              }
+            ],
+            "dns": {
+              "servers": ["https+local://1.1.1.1/dns-query", "8.8.8.8", "localhost"]
+            }
           }
-        ]
-      },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": {
-          "path": "${WS_PATH}",
-          "headers": {
-            "Host": "${DOMAIN}"
-          }
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls"]
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "settings": {}
-    }
-  ],
-  "dns": {
-    "servers": ["https+local://1.1.1.1/dns-query", "8.8.8.8", "localhost"]
-  }
-}
-EOF
+          EOF
           sudo mkdir -p /usr/local/etc/v2ray
           sudo cp /tmp/config.json /usr/local/etc/v2ray/config.json
           echo "v2ray config written to /usr/local/etc/v2ray/config.json"
@@ -270,24 +285,24 @@ EOF
             echo "#### VMess link (for V2RayN, v2rayNG, Clash, etc.)"
             # Generate base64 VMess link
             VMESS_JSON=$(cat <<EOJ
-{
-  "v": "2",
-  "ps": "gh-v2ray-$DOMAIN",
-  "add": "$DOMAIN",
-  "port": "$PORT",
-  "id": "$UUID",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "$DOMAIN",
-  "path": "$WS_PATH",
-  "tls": "",
-  "sni": "$DOMAIN",
-  "alpn": ""
-}
-EOJ
-)
+          {
+            "v": "2",
+            "ps": "gh-v2ray-$DOMAIN",
+            "add": "$DOMAIN",
+            "port": "$PORT",
+            "id": "$UUID",
+            "aid": "0",
+            "scy": "auto",
+            "net": "ws",
+            "type": "none",
+            "host": "$DOMAIN",
+            "path": "$WS_PATH",
+            "tls": "",
+            "sni": "$DOMAIN",
+            "alpn": ""
+          }
+          EOJ
+          )
             VMESS_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w0)"
             echo "\`$VMESS_LINK\`"
             echo ""
@@ -360,78 +375,6 @@ EOJ
           key: hermes-${{ runner.os }}-tools-v1
           restore-keys: |
             hermes-${{ runner.os }}-tools-
-
-      # ---------------------------------------------------------------- Hermes
-      # Every step here is self-contained and skips itself when a secret is
-      # missing, so an unconfigured backup repo or a failed Hermes install can
-      # never take the exit node down with it.
-
-      - name: Install Hermes Agent
-        run: |
-          curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
-            | bash -s -- --non-interactive --skip-browser --skip-computer-use
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          ~/.local/bin/hermes --version
-
-      - name: Import previous Hermes state
-        if: env.RESTORE_ZIP != ''
-        run: |
-          ~/.local/bin/hermes import "$RESTORE_ZIP" --force
-          rm -f "$RESTORE_ZIP"
-
-      - name: Configure Hermes
-        run: |
-          mkdir -p "$HOME/.hermes"
-          # Keep any keys the restored .env already has; only add/update ours.
-          touch "$HOME/.hermes/.env"
-          upsert() { # key, value
-            if grep -q "^$1=" "$HOME/.hermes/.env"; then
-              sed -i "s|^$1=.*|$1=$2|" "$HOME/.hermes/.env"
-            else
-              printf '%s=%s\n' "$1" "$2" >> "$HOME/.hermes/.env"
-            fi
-          }
-          if [ -n "$NVIDIA_API_KEY" ]; then
-            upsert NVIDIA_API_KEY    "$NVIDIA_API_KEY"
-            upsert NVIDIA_BASE_URL   "$NVIDIA_BASE_URL"
-            ~/.local/bin/hermes config set model.provider nvidia
-            ~/.local/bin/hermes config set model.default  "$HERMES_MODEL"
-          else
-            echo "::warning title=Hermes::NVIDIA_API_KEY secret not set - model left as restored"
-          fi
-          if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
-            upsert TELEGRAM_BOT_TOKEN     "$TELEGRAM_BOT_TOKEN"
-            upsert TELEGRAM_ALLOWED_USERS "$TELEGRAM_USER_ID"
-          else
-            echo "::warning title=Hermes::TELEGRAM_BOT_TOKEN secret not set - Telegram bridge off"
-          fi
-          chmod 600 "$HOME/.hermes/.env"
-          ~/.local/bin/hermes config check || true
-
-      - name: Start Hermes gateway
-        run: |
-          # Foreground `gateway run` is what a headless host wants, so supervise it
-          # ourselves: no systemd in the runner image, and no supervisor means no
-          # second copy fighting the first one over the bot token.
-          cat > "$HOME/run-hermes-gateway.sh" <<'SH'
-          #!/usr/bin/env bash
-          while true; do
-            "$HOME/.local/bin/hermes" gateway run --replace >> "$HOME/.hermes/logs/gateway.log" 2>&1
-            echo "[$(date -u +%FT%TZ)] gateway exited ($?) - restart in ${HERMES_RESTART_DELAY}s" \
-              >> "$HOME/.hermes/logs/gateway.log"
-            sleep "$HERMES_RESTART_DELAY"
-          done
-          SH
-          chmod +x "$HOME/run-hermes-gateway.sh"
-          mkdir -p "$HOME/.hermes/logs"
-          setsid nohup "$HOME/run-hermes-gateway.sh" >/dev/null 2>&1 &
-          echo $! > "$HOME/hermes-gateway.pid"
-          echo "gateway supervisor pid $(cat "$HOME/hermes-gateway.pid")"
-          for i in $(seq 1 60); do
-            grep -q . "$HOME/.hermes/logs/gateway.log" 2>/dev/null && break
-            sleep 1
-          done
-          tail -40 "$HOME/.hermes/logs/gateway.log" || true
 
       # -------------------------------------------------------------- OmniRoute
       # OmniRoute needs a modern Node (engines: >=22.22.2 <23 || >=24 <27) and
@@ -544,6 +487,93 @@ EOJ
           fi
           tail -40 "$HOME/omniroute-logs/omniroute.log" || true
 
+      # ---------------------------------------------------------------- Hermes
+      # Every step here is self-contained and skips itself when a secret is
+      # missing, so an unconfigured backup repo or a failed Hermes install can
+      # never take the exit node down with it.
+
+      - name: Install Hermes Agent
+        run: |
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
+            | bash -s -- --non-interactive --skip-browser --skip-computer-use
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          ~/.local/bin/hermes --version
+
+      - name: Import previous Hermes state
+        if: env.RESTORE_ZIP != ''
+        run: |
+          ~/.local/bin/hermes import "$RESTORE_ZIP" --force
+          rm -f "$RESTORE_ZIP"
+
+      - name: Configure Hermes
+        run: |
+          mkdir -p "$HOME/.hermes"
+          # Keep any keys the restored .env already has; only add/update ours.
+          touch "$HOME/.hermes/.env"
+          upsert() { # key, value
+            if grep -q "^$1=" "$HOME/.hermes/.env"; then
+              sed -i "s|^$1=.*|$1=$2|" "$HOME/.hermes/.env"
+            else
+              printf '%s=%s\n' "$1" "$2" >> "$HOME/.hermes/.env"
+            fi
+          }
+          # OmniRoute first: it is the OpenAI-compatible endpoint the agent should
+          # be talking to when the secret is set.
+          if [ -n "$OMNIROUTE_API_KEY" ]; then
+            # Hermes' provider stays "nvidia" - it already speaks the
+            # OpenAI-compatible wire format, so an OpenAI-compatible endpoint
+            # needs nothing more than a different base URL and key. The URL must
+            # use the tailnet IP: OmniRoute binds $NODE_IP only (see
+            # OMNIROUTE_SERVER_HOST in "Start OmniRoute"), localhost is refused,
+            # and MagicDNS is not resolvable on the runner itself because this
+            # node joins with --accept-dns=false.
+            upsert NVIDIA_BASE_URL   "http://$NODE_IP:${OMNIROUTE_PORT}/v1"
+            upsert NVIDIA_API_KEY    "$OMNIROUTE_API_KEY"
+            ~/.local/bin/hermes config set model.provider nvidia
+            ~/.local/bin/hermes config set model.default  "$OMNIROUTE_MODEL"
+            echo "Hermes model -> $OMNIROUTE_MODEL via http://$NODE_IP:${OMNIROUTE_PORT}/v1"
+          elif [ -n "$NVIDIA_API_KEY" ]; then
+            upsert NVIDIA_API_KEY    "$NVIDIA_API_KEY"
+            upsert NVIDIA_BASE_URL   "$NVIDIA_BASE_URL"
+            ~/.local/bin/hermes config set model.provider nvidia
+            ~/.local/bin/hermes config set model.default  "$HERMES_MODEL"
+          else
+            echo "::warning title=Hermes::neither OMNIROUTE_API_KEY nor NVIDIA_API_KEY is set - model left as restored"
+          fi
+          if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+            upsert TELEGRAM_BOT_TOKEN     "$TELEGRAM_BOT_TOKEN"
+            upsert TELEGRAM_ALLOWED_USERS "$TELEGRAM_USER_ID"
+          else
+            echo "::warning title=Hermes::TELEGRAM_BOT_TOKEN secret not set - Telegram bridge off"
+          fi
+          chmod 600 "$HOME/.hermes/.env"
+          ~/.local/bin/hermes config check || true
+
+      - name: Start Hermes gateway
+        run: |
+          # Foreground `gateway run` is what a headless host wants, so supervise it
+          # ourselves: no systemd in the runner image, and no supervisor means no
+          # second copy fighting the first one over the bot token.
+          cat > "$HOME/run-hermes-gateway.sh" <<'SH'
+          #!/usr/bin/env bash
+          while true; do
+            "$HOME/.local/bin/hermes" gateway run --replace >> "$HOME/.hermes/logs/gateway.log" 2>&1
+            echo "[$(date -u +%FT%TZ)] gateway exited ($?) - restart in ${HERMES_RESTART_DELAY}s" \
+              >> "$HOME/.hermes/logs/gateway.log"
+            sleep "$HERMES_RESTART_DELAY"
+          done
+          SH
+          chmod +x "$HOME/run-hermes-gateway.sh"
+          mkdir -p "$HOME/.hermes/logs"
+          setsid nohup "$HOME/run-hermes-gateway.sh" >/dev/null 2>&1 &
+          echo $! > "$HOME/hermes-gateway.pid"
+          echo "gateway supervisor pid $(cat "$HOME/hermes-gateway.pid")"
+          for i in $(seq 1 60); do
+            grep -q . "$HOME/.hermes/logs/gateway.log" 2>/dev/null && break
+            sleep 1
+          done
+          tail -40 "$HOME/.hermes/logs/gateway.log" || true
+
       - name: Publish address
         run: |
           {
@@ -571,15 +601,7 @@ EOJ
           while [ $SECONDS -lt $END ]; do
             tailscale status >/dev/null 2>&1 || echo "tailscaled hiccup"
             omni=$(curl -fsS "http://$NODE_IP:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1 && echo ok || echo down)
-            v2ray_status="off"
-            if [ -n "${V2RAY_DOMAIN:-}" ] && [ -n "${V2RAY_UUID:-}" ]; then
-              if curl -fsS "http://127.0.0.1:${V2RAY_PORT}" >/dev/null 2>&1 || ss -ltn | grep -q ":${V2RAY_PORT} "; then
-                v2ray_status="up"
-              else
-                v2ray_status="down"
-              fi
-            fi
-            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | hermes $(wc -l < "$HOME/.hermes/logs/gateway.log" 2>/dev/null || echo 0) log lines | omniroute $omni | v2ray $v2ray_status"
+            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | hermes $(wc -l < "$HOME/.hermes/logs/gateway.log" 2>/dev/null || echo 0) log lines | omniroute $omni"
             sleep 60
           done
 
@@ -614,19 +636,6 @@ EOJ
           pkill -f 'omniroute.*serve' 2>/dev/null || true
           sleep 3
           echo "omniroute stopped"
-
-      - name: Stop v2ray
-        if: always()
-        continue-on-error: true
-        run: |
-          if [ -f "$HOME/v2ray.pid" ]; then
-            kill -- -"$(cat "$HOME/v2ray.pid")" 2>/dev/null || true
-            kill "$(cat "$HOME/v2ray.pid")" 2>/dev/null || true
-          fi
-          pkill -f 'run-v2ray.sh' 2>/dev/null || true
-          pkill -f 'v2ray run' 2>/dev/null || true
-          sleep 2
-          echo "v2ray stopped"
 
       - name: Back up state to GitHub
         if: always()
