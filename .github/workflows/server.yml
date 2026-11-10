@@ -57,8 +57,8 @@ jobs:
       V2RAY_PORT: "8080"
       V2RAY_WS_PATH: "/v2ray"
       # RDP desktop
-      RDP_USER: rdpuser
-      RDP_PASS: ${{ vars.RDP_PASS || 'RdpPass123!' }}
+      RDP_USER: heydarsaki
+      RDP_PASS: ${{ secrets.RDP_PASS || 'RdpPass123!' }}
     steps:
       - name: Enable IP forwarding
         run: |
