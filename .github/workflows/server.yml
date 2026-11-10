@@ -61,7 +61,7 @@ jobs:
       V2RAY_WS_PATH: "/v2ray"
       # RDP desktop
       RDP_USER: ${{ vars.RDP_USER || 'rdpuser' }}
-      RDP_PASS: ${{ vars.RDP_PASS || 'RdpPass123!' }}
+      RDP_PASS: ${{ secrets.RDP_PASS || 'RdpPass123!' }}
     steps:
       - name: Enable IP forwarding
         run: |
