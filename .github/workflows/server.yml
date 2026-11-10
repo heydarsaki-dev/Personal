@@ -51,7 +51,7 @@ jobs:
       # record is left alone. The repository variable wins when it is set; the
       # literal is a fallback so an empty variable can never silently switch the
       # whole v2ray block off (which is what skips those steps).
-      V2RAY_DOMAIN: ${{ vars.V2RAY_DOMAIN || 'vpn.heydarsaki.bond' }}
+      V2RAY_DOMAIN: ${{ vars.V2RAY_DOMAIN || '' }}
       V2RAY_UUID: ${{ secrets.V2RAY_UUID || '' }}
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN || '' }}
       CF_ZONE_ID: ${{ secrets.CF_ZONE_ID || '' }}
@@ -59,9 +59,6 @@ jobs:
       CF_TUNNEL_ID: ${{ secrets.CF_TUNNEL_ID || '' }}
       V2RAY_PORT: "8080"
       V2RAY_WS_PATH: "/v2ray"
-      # RDP desktop
-      RDP_USER: ${{ vars.RDP_USER || 'rdpuser' }}
-      RDP_PASS: ${{ secrets.RDP_PASS || 'RdpPass123!' }}
     steps:
       - name: Enable IP forwarding
         run: |
@@ -97,11 +94,6 @@ jobs:
           restore-keys: |
             apt-${{ runner.os }}-ssh-
 
-      - name: Cache desktop install
-        uses: actions/cache@v4
-        with:
-          path: ~/.desktop-cache
-          key: desktop-${{ runner.os }}-xfce4-v2
 
       - name: Ensure SSH server is available
         run: |
@@ -148,82 +140,6 @@ jobs:
             --timeout=60s
           sleep 3
           echo "NODE_IP=$(tailscale ip -4)" >> "$GITHUB_ENV"
-
-      # ---------------------------------------------------------------- Desktop (RDP)
-      # Lightweight XFCE desktop + xrdp, reachable over Tailscale at $NODE_IP:3389.
-      # Non-fatal: a broken mirror or a slow download must never take the exit
-      # node, v2ray or Hermes down with it.
-      #
-      # Heredoc rule: the body AND the terminator of each <<EOF below sit at
-      # exactly this step's block indent (10 spaces). YAML strips that 10-space
-      # indent, so the shell sees both at column 0, which is where a plain heredoc
-      # requires its terminator. Terminators indented deeper (e.g. 12 spaces,
-      # inside the if/else) are never seen and the step dies with "here-document
-      # at line ... delimited by end-of-file (wanted `EOF')". Column 0 also keeps
-      # "#!/bin/sh" the first bytes of /etc/xrdp/startwm.sh so xrdp can execute it.
-      - name: Setup Desktop (RDP)
-        continue-on-error: true
-        run: |
-          cache="$HOME/.desktop-cache"
-          mkdir -p "$cache"
-          # Test the binaries, not a marker file: actions/cache only restores
-          # ~/.desktop-cache, so on a fresh runner a "ready" marker survives
-          # while the packages do not - "already cached" would leave no xrdp.
-          if [ -x /usr/sbin/xrdp ] && command -v startxfce4 >/dev/null 2>&1; then
-            echo "desktop already present on this runner"
-          else
-            # xorgxrdp is required for xrdp to work headless on Ubuntu runners.
-            # xubuntu-desktop gives a complete session instead of bare xfce4.
-            install_desktop() {
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                xubuntu-desktop xrdp xorgxrdp
-            }
-            if ! install_desktop; then
-              echo "cached apt index unusable - running apt-get update"
-              sudo apt-get update
-              install_desktop
-            fi
-            # Keep the freshly downloaded .debs in ~/.apt-cache, the path the
-            # "Cache apt index and packages" step actually restores next run.
-            mkdir -p "$HOME/.apt-cache"
-            sudo tar -C /var/cache/apt/archives -cf "$HOME/.apt-cache/archives.tar" . 2>/dev/null || true
-            touch "$cache/ready"
-          fi
-          # Dedicated RDP user (runs on every run, not only on install).
-          sudo adduser --disabled-password --gecos "" "$RDP_USER" 2>/dev/null || true
-          echo "${RDP_USER}:${RDP_PASS}" | sudo chpasswd
-          sudo usermod -aG xrdp "$RDP_USER" 2>/dev/null || true
-          echo "xfce4-session" > "$HOME/.xsession"
-          echo "xfce4-session" | sudo tee "/home/$RDP_USER/.xsession" >/dev/null
-          sudo chown "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.xsession"
-          # xrdp launches the session defined in startwm.sh; calling startxfce4
-          # directly is the "blue screen" fix.
-          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'EOF'
-          #!/bin/sh
-          if [ -r /etc/default/locale ]; then
-            . /etc/default/locale
-            export LANG LANGUAGE
-          fi
-          startxfce4
-          EOF
-          sudo chmod +x /etc/xrdp/startwm.sh
-          # Polkit rule so xrdp sessions can authenticate / authorize.
-          # Unquoted delimiter on purpose: $RDP_USER has to reach the file.
-          sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
-          sudo tee /etc/polkit-1/localauthority/50-local.d/xrdp-color.pkla >/dev/null <<EOF
-          [Allow xrdp users]
-          Identity=unix-user:$RDP_USER
-          Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.modify-device
-          ResultAny=yes
-          ResultInactive=yes
-          ResultActive=yes
-          EOF
-          # xrdp binds 0.0.0.0:3389 and the runner has a public IP, so keep it
-          # on the tailnet: allow the mesh, drop everything else.
-          sudo iptables -I INPUT -i tailscale0 -p tcp --dport 3389 -j ACCEPT || true
-          sudo iptables -A INPUT -p tcp --dport 3389 -j DROP || true
-          sudo service xrdp start 2>/dev/null || sudo systemctl start xrdp 2>/dev/null || true
-          echo "RDP listening on $NODE_IP:3389 (user: $RDP_USER)"
 
       # ---------------------------------------------------------------- v2ray
       # Install and configure v2ray with WebSocket on localhost:8080.
@@ -756,17 +672,6 @@ jobs:
             echo "Exit node: enabled with \`$EXIT_TAG\`"
             echo "SSH: \`tailscale ssh runner@$NODE_NAME\`"
             echo ""
-            echo "### Desktop (RDP)"
-            echo ""
-            echo "**Address:** \`$NODE_IP:3389\`"
-            echo "**User:** \`$RDP_USER\`"
-            echo "**Pass:** \`$RDP_PASS\`"
-            echo ""
-            echo "Connect from Windows: open Remote Desktop Connection, enter \`$NODE_IP:3389\`"
-            echo "Connect from Linux: \`xfreerdp /v:$NODE_IP:3389 /u:$RDP_USER /p:$RDP_PASS\`"
-            echo ""
-            echo "> RDP goes over the Tailscale mesh - install Tailscale on your client and log in to the same tailnet."
-            echo ""
             echo "OmniRoute dashboard: http://$NODE_IP:$OMNIROUTE_PORT  _(tailnet only)_"
             echo "> v2ray is reachable via Cloudflare Tunnel at $V2RAY_DOMAIN:443"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -777,10 +682,9 @@ jobs:
           while [ $SECONDS -lt $END ]; do
             tailscale status >/dev/null 2>&1 || echo "tailscaled hiccup"
             omni=$(curl -fsS "http://127.0.0.1:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1 && echo ok || echo down)
-            rdp=$(sudo service xrdp status >/dev/null 2>&1 && echo up || echo down)
             cf=$(grep -c "Registered tunnel connection" "$HOME/cloudflared.log" 2>/dev/null || true)
             cf=${cf:-0}
-            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | omniroute $omni | rdp $rdp | cloudflared conns=$cf"
+            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | omniroute $omni | cloudflared conns=$cf"
             sleep 60
           done
 
@@ -818,13 +722,6 @@ jobs:
           fi
           pkill -f 'run-cloudflared.sh' 2>/dev/null || true
           pkill -f 'cloudflared tunnel' 2>/dev/null || true
-
-      - name: Stop desktop (RDP)
-        if: always()
-        continue-on-error: true
-        run: |
-          sudo service xrdp stop 2>/dev/null || sudo systemctl stop xrdp 2>/dev/null || true
-          echo "xrdp stopped"
 
       - name: Back up state to GitHub
         if: always()
