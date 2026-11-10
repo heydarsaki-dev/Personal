@@ -98,7 +98,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.desktop-cache
-          key: desktop-${{ runner.os }}-xfce4-v1
+          key: desktop-${{ runner.os }}-xfce4-v2
 
       - name: Ensure SSH server is available
         run: |
@@ -156,15 +156,39 @@ jobs:
           if [ -f "$cache/ready" ]; then
             echo "Desktop already cached - skipping install"
           else
+            # xorgxrdp is required for xrdp to work headless on Ubuntu runners.
+            # xubuntu-desktop gives a complete session instead of bare xfce4.
             sudo apt-get update
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              xfce4 xfce4-goodies xrdp
+              xubuntu-desktop xrdp xorgxrdp
             # xrdp launches the session defined in .xsession
             echo "xfce4-session" > "$HOME/.xsession"
             # Dedicated RDP user
             sudo adduser --disabled-password --gecos "" "$RDP_USER" 2>/dev/null || true
             echo "${RDP_USER}:${RDP_PASS}" | sudo chpasswd
             sudo usermod -aG xrdp "$RDP_USER" 2>/dev/null || true
+            echo "xfce4-session" | sudo tee "/home/$RDP_USER/.xsession" >/dev/null
+            sudo chown "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.xsession"
+            # Fix xrdp session startup (blue screen fix): launch startxfce4 directly.
+            sudo tee /etc/xrdp/startwm.sh >/dev/null <<'EOF'
+            #!/bin/sh
+            if [ -r /etc/default/locale ]; then
+              . /etc/default/locale
+              export LANG LANGUAGE
+            fi
+            startxfce4
+            EOF
+            sudo chmod +x /etc/xrdp/startwm.sh
+            # Polkit rule so xrdp sessions can authenticate / authorize.
+            sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
+            sudo tee /etc/polkit-1/localauthority/50-local.d/xrdp-color.pkla >/dev/null <<'EOF'
+            [Allow xrdp users]
+            Identity=unix-user:$RDP_USER
+            Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.modify-device
+            ResultAny=yes
+            ResultInactive=yes
+            ResultActive=yes
+            EOF
             touch "$cache/ready"
             echo "Desktop installed and cached"
           fi
@@ -324,6 +348,7 @@ jobs:
           }
           EOF
           sudo mkdir -p /usr/local/etc/v2ray
+          sudo cp /tmp/config.json /tmp/config.json.bak 2>/dev/null || true
           sudo cp /tmp/config.json /usr/local/etc/v2ray/config.json
           /usr/local/bin/v2ray test -config /usr/local/etc/v2ray/config.json
           echo "v2ray config written (listening on 127.0.0.1:${PORT}, cloudflared forwards to it)"
