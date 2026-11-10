@@ -286,12 +286,24 @@ jobs:
           # a client (with V2RAY_DOMAIN on a subdomain the second name is
           # www.<subdomain>).
           for NAME in "$DOMAIN" "www.$DOMAIN"; do
+            # Look up any record with this name (not just A): a CNAME with the
+            # same name blocks A-record creation (Cloudflare error 81054).
             GET_BODY=$(curl -sS "${AUTH[@]}" \
-              "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=A&name=$NAME&per_page=1")
-            RECORD_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success and (.result | length) > 0 then .result[0].id else empty end')
-            if [ -n "$RECORD_ID" ]; then
+              "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$NAME&per_page=50")
+            A_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success then (.result[] | select(.type=="A") | .id) else empty end' | head -1)
+            CNAME_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success then (.result[] | select(.type=="CNAME") | .id) else empty end' | head -1)
+            # A CNAME and an A record cannot share a name, so remove the CNAME
+            # first, then create/update the A record.
+            if [ -n "$CNAME_ID" ]; then
+              curl -sS -X DELETE "${AUTH[@]}" \
+                "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$CNAME_ID" \
+                | jq -r '.success // empty' >/dev/null \
+                && echo "deleted conflicting CNAME record for $NAME" \
+                || echo "::warning title=Cloudflare::could not delete CNAME for $NAME"
+            fi
+            if [ -n "$A_ID" ]; then
               METHOD=PUT
-              URL="https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID"
+              URL="https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$A_ID"
             else
               METHOD=POST
               URL="https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records"
