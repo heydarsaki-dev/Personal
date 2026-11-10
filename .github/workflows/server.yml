@@ -131,8 +131,10 @@ jobs:
       # management (only domain registration). Options:
       #   1. Manual: Copy the IP from workflow summary -> NicNames DNS panel
       #   2. Cloudflare (recommended): Add domain to Cloudflare, set NS at NicNames
-      #      to Cloudflare's, add a CF_API_TOKEN secret (Zone.DNS Edit) for
-      #      auto-update; CF_ZONE_ID is optional - the zone is looked up by name.
+      #      to Cloudflare's, add a CF_API_TOKEN secret for auto-update: either a
+      #      scoped API Token (Zone.DNS Edit) sent as Bearer, or a Global API
+      #      Key (37 hex chars) plus CF_API_EMAIL sent as X-Auth-Key.
+      #      CF_ZONE_ID is optional - the zone is looked up by name.
 
       # NOTE ON INDENTATION: every line of a heredoc body below is indented to
       # this step's block level (10 spaces) or deeper, and each terminator (EOF,
@@ -153,6 +155,9 @@ jobs:
         env:
           DOMAIN: ${{ vars.V2RAY_DOMAIN }}
           CF_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          # Optional, only for a Global API Key (37 hex chars); a scoped API
+          # Token authenticates with the Bearer header and needs neither.
+          CF_EMAIL: ${{ secrets.CF_API_EMAIL }}
           # Optional: the zone id is derived from DOMAIN, this is only a fallback
           # for domains whose zone name differs from DOMAIN.
           CF_ZONE: ${{ secrets.CF_ZONE_ID }}
@@ -160,24 +165,57 @@ jobs:
         run: |
           # Resolve the zone from the domain instead of trusting the
           # CF_ZONE_ID secret: a stale/mismatched zone id fails with Cloudflare's
-          # opaque 7003 "Could not route...", which is what broke this step
-          # before. The token is the only value that has to be right.
-          ZONES=$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+          # opaque 7003 "Could not route...". The credential is the only value
+          # that has to be right, so normalise and type-check it first.
+          # A secret pasted from a browser often keeps quotes/newlines around
+          # the value, which Cloudflare answers with 9106 "Authentication
+          # failed" no matter what the token's permissions are.
+          CF_TOKEN=$(printf '%s' "$CF_TOKEN" | tr -d '\r' | tr -d '"' | tr -d "'")
+          CF_TOKEN=$(printf '%s' "$CF_TOKEN" | xargs)
+          if [ -z "$CF_TOKEN" ]; then
+            echo "::warning title=Cloudflare::CF_API_TOKEN is empty once whitespace/quotes are stripped - A record left alone, point it at $PUBLIC_IP by hand"
+            exit 0
+          fi
+
+          # Two credential types exist and they use different headers: a Global
+          # API Key is exactly 37 hex characters and goes in X-Auth-Key with the
+          # account email, while a scoped API Token is a long base64-ish string
+          # sent as "Authorization: Bearer". Sending a Global key as Bearer is
+          # the classic 9106 "Authentication failed (status: 400)".
+          if printf '%s' "$CF_TOKEN" | grep -Eq '^[0-9a-f]{37}$'; then
+            if [ -z "$CF_EMAIL" ]; then
+              echo "::warning title=Cloudflare::CF_API_TOKEN is a Global API Key, which needs the account email in CF_API_EMAIL - add that secret, or create a scoped API Token (Zone -> DNS -> Edit); A record left alone, point it at $PUBLIC_IP by hand"
+              exit 0
+            fi
+            AUTH=(-H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_TOKEN")
+            echo "Cloudflare auth: Global API Key + CF_API_EMAIL"
+          else
+            AUTH=(-H "Authorization: Bearer $CF_TOKEN")
+            echo "Cloudflare auth: API Token (Bearer), length ${#CF_TOKEN}"
+          fi
+
+          ZONES=$(curl -sS "${AUTH[@]}" \
             "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN&per_page=50")
           ZONE_ID=$(printf '%s' "$ZONES" | jq -r --arg d "$DOMAIN" \
             'if .success and (.result | length) > 0 then (.result[] | select(.name == $d) | .id) else empty end' | head -1)
-          ZONE_ID=${ZONE_ID:-$CF_ZONE}
-          if [ -z "$ZONE_ID" ]; then
-            echo "::warning title=Cloudflare::$DOMAIN is not a zone on this account (CF_ZONE_ID fallback empty) - A record left alone, point it at $PUBLIC_IP by hand"
-            echo "zones visible to this token (names/status only):"
-            printf '%s' "$ZONES" | jq -r '.result[]? | "  \(.name)  \(.status)"' | head -20
+          if [ -n "$ZONE_ID" ]; then
+            echo "Zone $DOMAIN resolved through the API: $ZONE_ID"
+          else
+            ZONE_ID=$CF_ZONE
+            echo "::warning title=Cloudflare::could not list zones with this credential - falling back to CF_ZONE_ID"
+            echo "zone lookup response:"
             printf '%s' "$ZONES" | head -c 400
             echo
+          fi
+          if [ -z "$ZONE_ID" ]; then
+            echo "::warning title=Cloudflare::$DOMAIN is not a zone on this account (CF_ZONE_ID fallback empty) - A record left alone, point it at $PUBLIC_IP by hand"
+            echo "zones visible to this credential (names/status only):"
+            printf '%s' "$ZONES" | jq -r '.result[]? | "  \(.name)  \(.status)"' | head -20
             exit 0
           fi
           # Cloudflare's API matches the FQDN (the UI's "@"), and the body is kept
           # (no -f) so a 404/403 prints the API's own reason, not curl's error.
-          GET_BODY=$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+          GET_BODY=$(curl -sS "${AUTH[@]}" \
             "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=A&name=$DOMAIN&per_page=1")
           RECORD_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success and (.result | length) > 0 then .result[0].id else empty end')
           if [ -n "$RECORD_ID" ]; then
@@ -187,7 +225,7 @@ jobs:
             METHOD=POST
             URL="https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records"
           fi
-          BODY=$(curl -sS -X "$METHOD" -H "Authorization: Bearer $CF_TOKEN" \
+          BODY=$(curl -sS -X "$METHOD" "${AUTH[@]}" \
             -H "Content-Type: application/json" "$URL" \
             -d "{\"type\":\"A\",\"name\":\"$DOMAIN\",\"content\":\"$PUBLIC_IP\",\"ttl\":300,\"proxied\":false}")
           if printf '%s' "$BODY" | jq -e '.success' >/dev/null 2>&1; then
@@ -198,13 +236,24 @@ jobs:
             fi
           else
             # DNS failure must not take the node down (or hide itself): the A
-            # record can be pointed at $PUBLIC_IP by hand, so warn loudly.
+            # record can be pointed at $PUBLIC_IP by hand, so warn loudly and
+            # say which of the three usual causes the error code points at.
             echo "::warning title=Cloudflare::A record not updated for $DOMAIN (HTTP body below)"
             echo "method: $METHOD url: $URL"
             printf '%s' "$BODY" | head -c 400
             echo
+            ERR=$(printf '%s' "$BODY" | jq -r '(.errors // [])[] | .code' 2>/dev/null | head -1)
+            case "$ERR" in
+              9106|10000)
+                echo "hint: code $ERR = Cloudflare rejected the credential itself, not the zone. Re-copy CF_API_TOKEN with no quotes/spaces/newlines; if it is a 37-character Global API Key it also needs CF_API_EMAIL (sent as X-Auth-Key, not Bearer); if it was rolled, generate a new token." ;;
+              9107|9109)
+                echo "hint: code $ERR = the credential is valid but not allowed here. Give the token Zone -> DNS -> Edit for $DOMAIN (and keep Zone -> Zone -> Read if you want the lookup to work)." ;;
+              7003)
+                echo "hint: code $ERR = the zone id does not belong to this credential, so CF_ZONE_ID points at a zone this account cannot see." ;;
+              *)
+                echo "hint: code $ERR - see https://developers.cloudflare.com/fundamentals/api/reference/errors/" ;;
+            esac
           fi
-
       - name: Install v2ray
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
         run: |
@@ -316,21 +365,12 @@ jobs:
           PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
           NODE_IP: ${{ env.NODE_IP }}
         run: |
-          {
-            echo "### v2ray (VMess + WebSocket) is up"
-            echo ""
-            echo "**Public IP:** \`$PUBLIC_IP\`"
-            echo "**Tailscale IP:** \`$NODE_IP\`"
-            echo "**Domain:** \`$DOMAIN\` (point A record to \`$PUBLIC_IP\` if not auto-updated)"
-            echo "**Port:** \`$PORT\`"
-            echo "**UUID:** \`$UUID\`"
-            echo "**WebSocket Path:** \`$WS_PATH\`"
-            echo "**Network:** ws"
-            echo "**Security:** none (use Cloudflare proxy for TLS, or add TLS certs)"
-            echo ""
-            echo "#### VMess link (for V2RayN, v2rayNG, Clash, etc.)"
-            # Generate base64 VMess link
-            VMESS_JSON=$(cat <<EOJ
+          # Build the VMess link once, then show it twice: as plain text in the
+          # step log (readable while the run is going, which is what you are
+          # looking at) and as markdown in the run summary. Previously every
+          # echo went straight into $GITHUB_STEP_SUMMARY, so this step's log was
+          # empty and looked like it had printed nothing at all.
+          VMESS_JSON=$(cat <<EOJ
           {
             "v": "2",
             "ps": "gh-v2ray-$DOMAIN",
@@ -349,7 +389,34 @@ jobs:
           }
           EOJ
           )
-            VMESS_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w0)"
+          VMESS_LINK="vmess://$(printf '%s' "$VMESS_JSON" | base64 -w0)"
+
+          echo "================ v2ray connection info ================"
+          echo "domain       : $DOMAIN"
+          echo "public IP    : $PUBLIC_IP   (the A record must point here)"
+          echo "tailscale IP : $NODE_IP"
+          echo "port         : $PORT/tcp"
+          echo "uuid         : $UUID"
+          echo "ws path      : $WS_PATH"
+          echo "network      : ws | security: none (Cloudflare proxy for TLS)"
+          echo ""
+          echo "vmess link (import into V2RayN / v2rayNG / Clash):"
+          echo "$VMESS_LINK"
+          echo "======================================================"
+
+          {
+            echo "### v2ray (VMess + WebSocket) is up"
+            echo ""
+            echo "**Public IP:** \`$PUBLIC_IP\`"
+            echo "**Tailscale IP:** \`$NODE_IP\`"
+            echo "**Domain:** \`$DOMAIN\` (point A record to \`$PUBLIC_IP\` if not auto-updated)"
+            echo "**Port:** \`$PORT\`"
+            echo "**UUID:** \`$UUID\`"
+            echo "**WebSocket Path:** \`$WS_PATH\`"
+            echo "**Network:** ws"
+            echo "**Security:** none (use Cloudflare proxy for TLS, or add TLS certs)"
+            echo ""
+            echo "#### VMess link (for V2RayN, v2rayNG, Clash, etc.)"
             echo "\`$VMESS_LINK\`"
             echo ""
             echo "> **Note:** The runner IP changes every run. Update your DNS A record for \`$DOMAIN\` to \`$PUBLIC_IP\` or use the VMess link with \`add\` set to the current IP."
