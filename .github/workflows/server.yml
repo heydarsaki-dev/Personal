@@ -47,18 +47,21 @@ jobs:
       OMNIROUTE_MODEL: ${{ vars.OMNIROUTE_MODEL || 'MyCombo' }}
       OMNIROUTE_VERSION: "3.8.53"
       OMNIROUTE_PORT: "20128"
-      V2RAY_DOMAIN: ${{ vars.V2RAY_DOMAIN  || '' }}
+      # v2ray — the DNS name clients use, published as a subdomain so the apex
+      # record is left alone. The repository variable wins when it is set; the
+      # literal is a fallback so an empty variable can never silently switch the
+      # whole v2ray block off (which is what skips those steps).
+      V2RAY_DOMAIN: ${{ vars.V2RAY_DOMAIN || 'vpn.heydarsaki.bond' }}
       V2RAY_UUID: ${{ secrets.V2RAY_UUID || '' }}
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN || '' }}
       CF_ZONE_ID: ${{ secrets.CF_ZONE_ID || '' }}
       CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || '' }}
       CF_TUNNEL_ID: ${{ secrets.CF_TUNNEL_ID || '' }}
-      NICNAMES_API_TOKEN: ${{ secrets.NICNAMES_API_TOKEN || '' }}
       V2RAY_PORT: "8080"
       V2RAY_WS_PATH: "/v2ray"
       # RDP desktop
-      RDP_USER: heydarsaki
-      RDP_PASS: ${{ secrets.RDP_PASS || 'RdpPass123!' }}
+      RDP_USER: ${{ vars.RDP_USER || 'rdpuser' }}
+      RDP_PASS: ${{ vars.RDP_PASS || 'RdpPass123!' }}
     steps:
       - name: Enable IP forwarding
         run: |
@@ -147,53 +150,80 @@ jobs:
           echo "NODE_IP=$(tailscale ip -4)" >> "$GITHUB_ENV"
 
       # ---------------------------------------------------------------- Desktop (RDP)
-      # Lightweight XFCE desktop + xrdp. Cached across runs so reinstall is skipped.
-      # Accessible over Tailscale at $NODE_IP:3389.
+      # Lightweight XFCE desktop + xrdp, reachable over Tailscale at $NODE_IP:3389.
+      # Non-fatal: a broken mirror or a slow download must never take the exit
+      # node, v2ray or Hermes down with it.
+      #
+      # Heredoc rule: the body AND the terminator of each <<EOF below sit at
+      # exactly this step's block indent (10 spaces). YAML strips that 10-space
+      # indent, so the shell sees both at column 0, which is where a plain heredoc
+      # requires its terminator. Terminators indented deeper (e.g. 12 spaces,
+      # inside the if/else) are never seen and the step dies with "here-document
+      # at line ... delimited by end-of-file (wanted `EOF')". Column 0 also keeps
+      # "#!/bin/sh" the first bytes of /etc/xrdp/startwm.sh so xrdp can execute it.
       - name: Setup Desktop (RDP)
+        continue-on-error: true
         run: |
           cache="$HOME/.desktop-cache"
           mkdir -p "$cache"
-          if [ -f "$cache/ready" ]; then
-            echo "Desktop already cached - skipping install"
+          # Test the binaries, not a marker file: actions/cache only restores
+          # ~/.desktop-cache, so on a fresh runner a "ready" marker survives
+          # while the packages do not - "already cached" would leave no xrdp.
+          if [ -x /usr/sbin/xrdp ] && command -v startxfce4 >/dev/null 2>&1; then
+            echo "desktop already present on this runner"
           else
             # xorgxrdp is required for xrdp to work headless on Ubuntu runners.
             # xubuntu-desktop gives a complete session instead of bare xfce4.
-            sudo apt-get update
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              xubuntu-desktop xrdp xorgxrdp
-            # xrdp launches the session defined in .xsession
-            echo "xfce4-session" > "$HOME/.xsession"
-            # Dedicated RDP user
-            sudo adduser --disabled-password --gecos "" "$RDP_USER" 2>/dev/null || true
-            echo "${RDP_USER}:${RDP_PASS}" | sudo chpasswd
-            sudo usermod -aG xrdp "$RDP_USER" 2>/dev/null || true
-            echo "xfce4-session" | sudo tee "/home/$RDP_USER/.xsession" >/dev/null
-            sudo chown "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.xsession"
-            # Fix xrdp session startup (blue screen fix): launch startxfce4 directly.
-            sudo tee /etc/xrdp/startwm.sh >/dev/null <<'EOF'
-            #!/bin/sh
-            if [ -r /etc/default/locale ]; then
-              . /etc/default/locale
-              export LANG LANGUAGE
+            install_desktop() {
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                xubuntu-desktop xrdp xorgxrdp
+            }
+            if ! install_desktop; then
+              echo "cached apt index unusable - running apt-get update"
+              sudo apt-get update
+              install_desktop
             fi
-            startxfce4
-            EOF
-            sudo chmod +x /etc/xrdp/startwm.sh
-            # Polkit rule so xrdp sessions can authenticate / authorize.
-            sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
-            sudo tee /etc/polkit-1/localauthority/50-local.d/xrdp-color.pkla >/dev/null <<'EOF'
-            [Allow xrdp users]
-            Identity=unix-user:$RDP_USER
-            Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.modify-device
-            ResultAny=yes
-            ResultInactive=yes
-            ResultActive=yes
-            EOF
+            # Keep the freshly downloaded .debs in ~/.apt-cache, the path the
+            # "Cache apt index and packages" step actually restores next run.
+            mkdir -p "$HOME/.apt-cache"
+            sudo tar -C /var/cache/apt/archives -cf "$HOME/.apt-cache/archives.tar" . 2>/dev/null || true
             touch "$cache/ready"
-            echo "Desktop installed and cached"
           fi
+          # Dedicated RDP user (runs on every run, not only on install).
+          sudo adduser --disabled-password --gecos "" "$RDP_USER" 2>/dev/null || true
+          echo "${RDP_USER}:${RDP_PASS}" | sudo chpasswd
+          sudo usermod -aG xrdp "$RDP_USER" 2>/dev/null || true
+          echo "xfce4-session" > "$HOME/.xsession"
+          echo "xfce4-session" | sudo tee "/home/$RDP_USER/.xsession" >/dev/null
+          sudo chown "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.xsession"
+          # xrdp launches the session defined in startwm.sh; calling startxfce4
+          # directly is the "blue screen" fix.
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'EOF'
+          #!/bin/sh
+          if [ -r /etc/default/locale ]; then
+            . /etc/default/locale
+            export LANG LANGUAGE
+          fi
+          startxfce4
+          EOF
+          sudo chmod +x /etc/xrdp/startwm.sh
+          # Polkit rule so xrdp sessions can authenticate / authorize.
+          # Unquoted delimiter on purpose: $RDP_USER has to reach the file.
+          sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
+          sudo tee /etc/polkit-1/localauthority/50-local.d/xrdp-color.pkla >/dev/null <<EOF
+          [Allow xrdp users]
+          Identity=unix-user:$RDP_USER
+          Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.modify-device
+          ResultAny=yes
+          ResultInactive=yes
+          ResultActive=yes
+          EOF
+          # xrdp binds 0.0.0.0:3389 and the runner has a public IP, so keep it
+          # on the tailnet: allow the mesh, drop everything else.
+          sudo iptables -I INPUT -i tailscale0 -p tcp --dport 3389 -j ACCEPT || true
+          sudo iptables -A INPUT -p tcp --dport 3389 -j DROP || true
           sudo service xrdp start 2>/dev/null || sudo systemctl start xrdp 2>/dev/null || true
-          echo "RDP listening on $NODE_IP:3389 (user: $RDP_USER, pass: $RDP_PASS)"
+          echo "RDP listening on $NODE_IP:3389 (user: $RDP_USER)"
 
       # ---------------------------------------------------------------- v2ray
       # Install and configure v2ray with WebSocket on localhost:8080.
@@ -208,10 +238,6 @@ jobs:
           echo "Runner public IP: $PUB_IP"
 
       - name: Update Cloudflare DNS CNAME record (tunnel target)
-        # For Cloudflare Tunnel, the domain must be a CNAME pointing at
-        # <TUNNEL_ID>.cfargotunnel.com, proxied (orange cloud). Cloudflare then
-        # terminates TLS at the edge and forwards through the tunnel to
-        # cloudflared -> localhost:8080 -> v2ray.
         if: env.V2RAY_DOMAIN != '' && env.CF_API_TOKEN != '' && env.CF_TUNNEL_ID != ''
         env:
           DOMAIN: ${{ env.V2RAY_DOMAIN }}
@@ -263,15 +289,12 @@ jobs:
 
           TARGET="${TUNNEL_ID}.cfargotunnel.com"
 
-          # Look up any record with this name: an existing A record conflicts
-          # with the CNAME we need (and vice versa).
           for NAME in "$DOMAIN" "www.$DOMAIN"; do
             GET_BODY=$(curl -sS "${AUTH[@]}" \
               "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$NAME&per_page=50")
             CNAME_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success then (.result[] | select(.type=="CNAME") | .id) else empty end' | head -1)
             A_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success then (.result[] | select(.type=="A") | .id) else empty end' | head -1)
 
-            # Remove conflicting A record(s) so the CNAME can be created.
             if [ -n "$A_ID" ]; then
               curl -sS -X DELETE "${AUTH[@]}" \
                 "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$A_ID" \
@@ -348,7 +371,6 @@ jobs:
           }
           EOF
           sudo mkdir -p /usr/local/etc/v2ray
-          sudo cp /tmp/config.json /tmp/config.json.bak 2>/dev/null || true
           sudo cp /tmp/config.json /usr/local/etc/v2ray/config.json
           /usr/local/bin/v2ray test -config /usr/local/etc/v2ray/config.json
           echo "v2ray config written (listening on 127.0.0.1:${PORT}, cloudflared forwards to it)"
@@ -377,12 +399,10 @@ jobs:
           tail -20 "$HOME/v2ray.log" || true
 
       # ---------------------------------------------------------------- Cloudflare Tunnel
-      # Public ingress: runner dials OUT to Cloudflare over QUIC/HTTPS.
-      # Cloudflare forwards client WebSocket connections to localhost:8080.
       - name: Start Cloudflare Tunnel (v2ray public entry point)
         if: env.V2RAY_DOMAIN != '' && env.CF_TUNNEL_ID != '' && env.CF_ACCOUNT_ID != '' && env.CF_API_TOKEN != ''
         env:
-          DOMAIN: ${{ vars.V2RAY_DOMAIN }}
+          DOMAIN: ${{ env.V2RAY_DOMAIN }}
           CF_TOKEN: ${{ secrets.CF_API_TOKEN }}
           ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           TUNNEL_ID: ${{ secrets.CF_TUNNEL_ID }}
@@ -399,7 +419,6 @@ jobs:
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
 
-          # Fetch tunnel token from Cloudflare API
           TOKEN_BODY=$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
             "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/token")
           TUNNEL_TOKEN=$(printf '%s' "$TOKEN_BODY" | jq -r '.result // empty')
@@ -410,7 +429,6 @@ jobs:
           printf '%s' "$TUNNEL_TOKEN" > "$HOME/.cloudflared-tunnel-token"
           chmod 600 "$HOME/.cloudflared-tunnel-token"
 
-          # Write ingress config to Cloudflare API
           INGRESS=$(cat <<EOJ
           {
             "config": {
@@ -433,7 +451,6 @@ jobs:
             echo "::warning title=Cloudflare::could not update tunnel ingress - set it manually in the dashboard"
           fi
 
-          # Supervised cloudflared
           cat > "$HOME/run-cloudflared.sh" <<'SH'
           #!/usr/bin/env bash
           while true; do
@@ -466,12 +483,11 @@ jobs:
       - name: Publish v2ray connection info
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
         env:
-          DOMAIN: ${{ vars.V2RAY_DOMAIN }}
+          DOMAIN: ${{ env.V2RAY_DOMAIN }}
           UUID: ${{ secrets.V2RAY_UUID }}
           PORT: ${{ env.V2RAY_PORT }}
           WS_PATH: ${{ env.V2RAY_WS_PATH }}
         run: |
-          # Client connects to Cloudflare on 443/TLS -> Cloudflare Tunnel -> v2ray on localhost:8080.
           CLIENT_PORT=443
           CLIENT_TLS=tls
           CLIENT_SNI="$DOMAIN"
@@ -752,7 +768,7 @@ jobs:
             echo "> RDP goes over the Tailscale mesh - install Tailscale on your client and log in to the same tailnet."
             echo ""
             echo "OmniRoute dashboard: http://$NODE_IP:$OMNIROUTE_PORT  _(tailnet only)_"
-            echo "> v2ray is reachable via Cloudflare Tunnel at $DOMAIN:443"
+            echo "> v2ray is reachable via Cloudflare Tunnel at $V2RAY_DOMAIN:443"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep alive
@@ -762,7 +778,8 @@ jobs:
             tailscale status >/dev/null 2>&1 || echo "tailscaled hiccup"
             omni=$(curl -fsS "http://127.0.0.1:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1 && echo ok || echo down)
             rdp=$(sudo service xrdp status >/dev/null 2>&1 && echo up || echo down)
-            cf=$(grep -c "Registered tunnel connection" "$HOME/cloudflared.log" 2>/dev/null || echo 0)
+            cf=$(grep -c "Registered tunnel connection" "$HOME/cloudflared.log" 2>/dev/null || true)
+            cf=${cf:-0}
             echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | omniroute $omni | rdp $rdp | cloudflared conns=$cf"
             sleep 60
           done
@@ -771,6 +788,7 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
+          mkdir -p "$HOME/.hermes/logs"
           ~/.local/bin/hermes gateway stop --yes --all >> "$HOME/.hermes/logs/gateway.log" 2>&1 || true
           if [ -f "$HOME/hermes-gateway.pid" ]; then
             kill -- -"$(cat "$HOME/hermes-gateway.pid")" 2>/dev/null || true
