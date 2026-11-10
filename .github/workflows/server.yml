@@ -373,7 +373,7 @@ jobs:
           VMESS_JSON=$(cat <<EOJ
           {
             "v": "2",
-            "ps": "gh-v2ray-$DOMAIN",
+            "ps": "$DOMAIN",
             "add": "$DOMAIN",
             "port": "$PORT",
             "id": "$UUID",
