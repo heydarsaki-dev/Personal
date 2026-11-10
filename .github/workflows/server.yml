@@ -56,6 +56,9 @@ jobs:
       NICNAMES_API_TOKEN: ${{ secrets.NICNAMES_API_TOKEN || '' }}
       V2RAY_PORT: "8080"
       V2RAY_WS_PATH: "/v2ray"
+      # RDP desktop
+      RDP_USER: rdpuser
+      RDP_PASS: ${{ vars.RDP_PASS || 'RdpPass123!' }}
     steps:
       - name: Enable IP forwarding
         run: |
@@ -90,6 +93,12 @@ jobs:
           key: apt-${{ runner.os }}-ssh-${{ github.run_id }}
           restore-keys: |
             apt-${{ runner.os }}-ssh-
+
+      - name: Cache desktop install
+        uses: actions/cache@v4
+        with:
+          path: ~/.desktop-cache
+          key: desktop-${{ runner.os }}-xfce4-v1
 
       - name: Ensure SSH server is available
         run: |
@@ -136,6 +145,31 @@ jobs:
             --timeout=60s
           sleep 3
           echo "NODE_IP=$(tailscale ip -4)" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------- Desktop (RDP)
+      # Lightweight XFCE desktop + xrdp. Cached across runs so reinstall is skipped.
+      # Accessible over Tailscale at $NODE_IP:3389.
+      - name: Setup Desktop (RDP)
+        run: |
+          cache="$HOME/.desktop-cache"
+          mkdir -p "$cache"
+          if [ -f "$cache/ready" ]; then
+            echo "Desktop already cached - skipping install"
+          else
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              xfce4 xfce4-goodies xrdp
+            # xrdp launches the session defined in .xsession
+            echo "xfce4-session" > "$HOME/.xsession"
+            # Dedicated RDP user
+            sudo adduser --disabled-password --gecos "" "$RDP_USER" 2>/dev/null || true
+            echo "${RDP_USER}:${RDP_PASS}" | sudo chpasswd
+            sudo usermod -aG xrdp "$RDP_USER" 2>/dev/null || true
+            touch "$cache/ready"
+            echo "Desktop installed and cached"
+          fi
+          sudo service xrdp start 2>/dev/null || sudo systemctl start xrdp 2>/dev/null || true
+          echo "RDP listening on $NODE_IP:3389 (user: $RDP_USER, pass: $RDP_PASS)"
 
       # ---------------------------------------------------------------- v2ray
       # Install and configure v2ray with WebSocket on localhost:8080.
@@ -577,7 +611,7 @@ jobs:
           mkdir -p "$HOME/.omniroute" "$HOME/omniroute-logs"
           export DATA_DIR="$HOME/.omniroute"
           export PORT="$OMNIROUTE_PORT"
-          export OMNIROUTE_SERVER_HOST="$NODE_IP"
+          export OMNIROUTE_SERVER_HOST="0.0.0.0"
           export REQUIRE_API_KEY=true
           export OMNIROUTE_NO_UPDATE_NOTIFIER=1
           export OMNIROUTE_MEMORY_MB=4096
@@ -597,7 +631,7 @@ jobs:
           echo $! > "$HOME/omniroute.pid"
           healthy=0
           for i in $(seq 1 90); do
-            if curl -fsS "http://$NODE_IP:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1; then
+            if curl -fsS "http://127.0.0.1:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1; then
               healthy=1
               break
             fi
@@ -635,7 +669,7 @@ jobs:
             fi
           }
           if [ -n "$OMNIROUTE_API_KEY" ]; then
-            upsert NVIDIA_BASE_URL   "http://$NODE_IP:${OMNIROUTE_PORT}/v1"
+            upsert NVIDIA_BASE_URL   "http://127.0.0.1:${OMNIROUTE_PORT}/v1"
             upsert NVIDIA_API_KEY    "$OMNIROUTE_API_KEY"
             ~/.local/bin/hermes config set model.provider nvidia
             ~/.local/bin/hermes config set model.default  "$OMNIROUTE_MODEL"
@@ -681,6 +715,17 @@ jobs:
             echo "Exit node: enabled with \`$EXIT_TAG\`"
             echo "SSH: \`tailscale ssh runner@$NODE_NAME\`"
             echo ""
+            echo "### Desktop (RDP)"
+            echo ""
+            echo "**Address:** \`$NODE_IP:3389\`"
+            echo "**User:** \`$RDP_USER\`"
+            echo "**Pass:** \`$RDP_PASS\`"
+            echo ""
+            echo "Connect from Windows: open Remote Desktop Connection, enter \`$NODE_IP:3389\`"
+            echo "Connect from Linux: \`xfreerdp /v:$NODE_IP:3389 /u:$RDP_USER /p:$RDP_PASS\`"
+            echo ""
+            echo "> RDP goes over the Tailscale mesh - install Tailscale on your client and log in to the same tailnet."
+            echo ""
             echo "OmniRoute dashboard: http://$NODE_IP:$OMNIROUTE_PORT  _(tailnet only)_"
             echo "> v2ray is reachable via Cloudflare Tunnel at $DOMAIN:443"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -690,9 +735,10 @@ jobs:
           END=$((SECONDS + RUN_MINUTES * 60 - 300))
           while [ $SECONDS -lt $END ]; do
             tailscale status >/dev/null 2>&1 || echo "tailscaled hiccup"
-            omni=$(curl -fsS "http://$NODE_IP:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1 && echo ok || echo down)
+            omni=$(curl -fsS "http://127.0.0.1:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1 && echo ok || echo down)
+            rdp=$(sudo service xrdp status >/dev/null 2>&1 && echo up || echo down)
             cf=$(grep -c "Registered tunnel connection" "$HOME/cloudflared.log" 2>/dev/null || echo 0)
-            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | omniroute $omni | cloudflared conns=$cf"
+            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | omniroute $omni | rdp $rdp | cloudflared conns=$cf"
             sleep 60
           done
 
@@ -729,6 +775,13 @@ jobs:
           fi
           pkill -f 'run-cloudflared.sh' 2>/dev/null || true
           pkill -f 'cloudflared tunnel' 2>/dev/null || true
+
+      - name: Stop desktop (RDP)
+        if: always()
+        continue-on-error: true
+        run: |
+          sudo service xrdp stop 2>/dev/null || sudo systemctl stop xrdp 2>/dev/null || true
+          echo "xrdp stopped"
 
       - name: Back up state to GitHub
         if: always()
