@@ -131,7 +131,8 @@ jobs:
       # management (only domain registration). Options:
       #   1. Manual: Copy the IP from workflow summary -> NicNames DNS panel
       #   2. Cloudflare (recommended): Add domain to Cloudflare, set NS at NicNames
-      #      to Cloudflare's, add CF_API_TOKEN + CF_ZONE_ID secrets for auto-update.
+      #      to Cloudflare's, add a CF_API_TOKEN secret (Zone.DNS Edit) for
+      #      auto-update; CF_ZONE_ID is optional - the zone is looked up by name.
 
       # NOTE ON INDENTATION: every line of a heredoc body below is indented to
       # this step's block level (10 spaces) or deeper, and each terminator (EOF,
@@ -148,34 +149,52 @@ jobs:
           echo "Runner public IP: $PUB_IP"
 
       - name: Update DNS A record (Cloudflare)
-        if: env.V2RAY_DOMAIN != '' && env.CF_API_TOKEN != '' && env.CF_ZONE_ID != ''
+        if: env.V2RAY_DOMAIN != '' && env.CF_API_TOKEN != ''
         env:
           DOMAIN: ${{ vars.V2RAY_DOMAIN }}
           CF_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          # Optional: the zone id is derived from DOMAIN, this is only a fallback
+          # for domains whose zone name differs from DOMAIN.
           CF_ZONE: ${{ secrets.CF_ZONE_ID }}
           PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
         run: |
-          # Find the existing A record. Cloudflare's API matches the FQDN (the
-          # UI's "@"), and the body is kept (no -f) so a 404/403 prints the API's
-          # own reason instead of curl's terse error.
+          # Resolve the zone from the domain instead of trusting the
+          # CF_ZONE_ID secret: a stale/mismatched zone id fails with Cloudflare's
+          # opaque 7003 "Could not route...", which is what broke this step
+          # before. The token is the only value that has to be right.
+          ZONES=$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN&per_page=50")
+          ZONE_ID=$(printf '%s' "$ZONES" | jq -r --arg d "$DOMAIN" \
+            'if .success and (.result | length) > 0 then (.result[] | select(.name == $d) | .id) else empty end' | head -1)
+          ZONE_ID=${ZONE_ID:-$CF_ZONE}
+          if [ -z "$ZONE_ID" ]; then
+            echo "::warning title=Cloudflare::$DOMAIN is not a zone on this account (CF_ZONE_ID fallback empty) - A record left alone, point it at $PUBLIC_IP by hand"
+            echo "zones visible to this token (names/status only):"
+            printf '%s' "$ZONES" | jq -r '.result[]? | "  \(.name)  \(.status)"' | head -20
+            printf '%s' "$ZONES" | head -c 400
+            echo
+            exit 0
+          fi
+          # Cloudflare's API matches the FQDN (the UI's "@"), and the body is kept
+          # (no -f) so a 404/403 prints the API's own reason, not curl's error.
           GET_BODY=$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
-            "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records?type=A&name=$DOMAIN&per_page=1")
+            "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=A&name=$DOMAIN&per_page=1")
           RECORD_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success and (.result | length) > 0 then .result[0].id else empty end')
           if [ -n "$RECORD_ID" ]; then
             METHOD=PUT
-            URL="https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records/$RECORD_ID"
+            URL="https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID"
           else
             METHOD=POST
-            URL="https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records"
+            URL="https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records"
           fi
           BODY=$(curl -sS -X "$METHOD" -H "Authorization: Bearer $CF_TOKEN" \
             -H "Content-Type: application/json" "$URL" \
             -d "{\"type\":\"A\",\"name\":\"$DOMAIN\",\"content\":\"$PUBLIC_IP\",\"ttl\":300,\"proxied\":false}")
           if printf '%s' "$BODY" | jq -e '.success' >/dev/null 2>&1; then
             if [ "$METHOD" = PUT ]; then
-              echo "Cloudflare A record updated to $PUBLIC_IP"
+              echo "Cloudflare A record updated to $PUBLIC_IP (zone $DOMAIN)"
             else
-              echo "Cloudflare A record created for $PUBLIC_IP"
+              echo "Cloudflare A record created for $PUBLIC_IP (zone $DOMAIN)"
             fi
           else
             # DNS failure must not take the node down (or hide itself): the A
@@ -203,6 +222,18 @@ jobs:
           WS_PATH: ${{ env.V2RAY_WS_PATH }}
           PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
         run: |
+          # A pasted secret often carries stray quotes, whitespace or upper
+          # case; v2ray needs the canonical lowercase UUID, and otherwise fails
+          # late inside the broker with "invalid UUID".
+          RAW="$UUID"
+          UUID=$(printf '%s' "$RAW" | tr -d '\r' | tr -d '"' | tr -d "'" | tr 'A-Z' 'a-z')
+          UUID=$(printf '%s' "$UUID" | xargs)
+          if ! printf '%s' "$UUID" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+            echo "::error title=v2ray::V2RAY_UUID is not a UUID - set the secret to 8-4-4-4-12 hex digits"
+            printf '  raw length: %s, normalized length: %s\n' "${#RAW}" "${#UUID}"
+            echo "  (check for surrounding quotes/spaces/newlines in the secret value)"
+            exit 1
+          fi
           cat > /tmp/config.json <<EOF
           {
             "inbounds": [
