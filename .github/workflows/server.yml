@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 jobs:
-  node:
+  Server:
     runs-on: ubuntu-latest
     timeout-minutes: 355        # hard cap is 360
     env:
@@ -400,9 +400,30 @@ jobs:
           echo "ws path      : $WS_PATH"
           echo "network      : ws | security: none (Cloudflare proxy for TLS)"
           echo ""
-          echo "vmess link (import into V2RayN / v2rayNG / Clash):"
-          echo "$VMESS_LINK"
+          echo "The vmess:// link is deliberately not printed here: it carries the"
+          echo "UUID, so GitHub masks part of it and the base64 copy becomes"
+          echo "unusable (it decodes to \"id\": \"***\"). Take the link from"
+          echo "  - this run's Summary page, or"
+          echo "  - the 'v2ray-connection' artifact of this run (plain text)"
           echo "======================================================"
+
+          # A file is not run through log masking, so the artifact below is the
+          # only place the link survives intact and stays copy-pasteable.
+          CONN_FILE="$RUNNER_TEMP/v2ray-connection.txt"
+          {
+            echo "v2ray connection info"
+            echo "domain       : $DOMAIN"
+            echo "public IP    : $PUBLIC_IP   (the A record must point here)"
+            echo "tailscale IP : $NODE_IP"
+            echo "port         : $PORT/tcp"
+            echo "uuid         : $UUID"
+            echo "ws path      : $WS_PATH"
+            echo "network      : ws | security: none (Cloudflare proxy for TLS)"
+            echo ""
+            echo "vmess link (import into V2RayN / v2rayNG / Clash):"
+            echo "$VMESS_LINK"
+          } > "$CONN_FILE"
+          echo "wrote $CONN_FILE (the same link is on the run Summary page)"
 
           {
             echo "### v2ray (VMess + WebSocket) is up"
@@ -422,6 +443,15 @@ jobs:
             echo "> **Note:** The runner IP changes every run. Update your DNS A record for \`$DOMAIN\` to \`$PUBLIC_IP\` or use the VMess link with \`add\` set to the current IP."
             echo "> For TLS, put Cloudflare in front (orange cloud) or add certs to v2ray config."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload v2ray connection info
+        if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2ray-connection
+          path: ${{ runner.temp }}/v2ray-connection.txt
+          retention-days: 1
+          if-no-files-found: warn
 
       # ---------------------------------------------------------------- Restore
       # One clone restores both apps. Each piece is optional: a missing zip
