@@ -51,15 +51,8 @@ jobs:
       V2RAY_UUID: ${{ secrets.V2RAY_UUID || '' }}
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN || '' }}
       CF_ZONE_ID: ${{ secrets.CF_ZONE_ID || '' }}
-      # Cloudflare Tunnel: the runner dials OUT to Cloudflare, so no inbound
-      # port is needed on the GitHub Actions runner. Requires CF_ACCOUNT_ID
-      # and CF_TUNNEL_ID secrets.
       CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || '' }}
       CF_TUNNEL_ID: ${{ secrets.CF_TUNNEL_ID || '' }}
-      # DNS record mode: "grey" = DNS-only A record (clients connect via
-      # Cloudflare Tunnel on 443). "orange" = proxied A record (WILL NOT WORK
-      # on a GitHub Actions runner - Cloudflare cannot reach inbound ports).
-      CF_MODE: ${{ vars.CF_MODE || 'grey' }}
       NICNAMES_API_TOKEN: ${{ secrets.NICNAMES_API_TOKEN || '' }}
       V2RAY_PORT: "8080"
       V2RAY_WS_PATH: "/v2ray"
@@ -156,17 +149,18 @@ jobs:
           echo "PUBLIC_IP=$PUB_IP" >> "$GITHUB_OUTPUT"
           echo "Runner public IP: $PUB_IP"
 
-      - name: Update Cloudflare DNS A record (grey cloud)
-        # Grey-cloud A record so the domain resolves to the runner IP.
-        # Traffic does NOT go directly to the runner (blocked on GH Actions).
-        # Instead, Cloudflare Tunnel handles the public ingress on 443.
-        if: env.V2RAY_DOMAIN != '' && env.CF_API_TOKEN != ''
+      - name: Update Cloudflare DNS CNAME record (tunnel target)
+        # For Cloudflare Tunnel, the domain must be a CNAME pointing at
+        # <TUNNEL_ID>.cfargotunnel.com, proxied (orange cloud). Cloudflare then
+        # terminates TLS at the edge and forwards through the tunnel to
+        # cloudflared -> localhost:8080 -> v2ray.
+        if: env.V2RAY_DOMAIN != '' && env.CF_API_TOKEN != '' && env.CF_TUNNEL_ID != ''
         env:
           DOMAIN: ${{ env.V2RAY_DOMAIN }}
           CF_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_EMAIL: ${{ secrets.CF_API_EMAIL }}
           CF_ZONE: ${{ secrets.CF_ZONE_ID }}
-          PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
+          TUNNEL_ID: ${{ secrets.CF_TUNNEL_ID }}
         run: |
           CF_TOKEN=$(printf '%s' "$CF_TOKEN" | tr -d '\r' | tr -d '"' | tr -d "'")
           CF_TOKEN=$(printf '%s' "$CF_TOKEN" | xargs)
@@ -209,33 +203,43 @@ jobs:
             exit 0
           fi
 
-          # Grey cloud: proxied=false. Cloudflare Tunnel handles ingress.
+          TARGET="${TUNNEL_ID}.cfargotunnel.com"
+
+          # Look up any record with this name: an existing A record conflicts
+          # with the CNAME we need (and vice versa).
           for NAME in "$DOMAIN" "www.$DOMAIN"; do
             GET_BODY=$(curl -sS "${AUTH[@]}" \
               "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$NAME&per_page=50")
-            A_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success then (.result[] | select(.type=="A") | .id) else empty end' | head -1)
             CNAME_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success then (.result[] | select(.type=="CNAME") | .id) else empty end' | head -1)
-            if [ -n "$CNAME_ID" ]; then
-              curl -sS -X DELETE "${AUTH[@]}" \
-                "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$CNAME_ID" \
-                | jq -r '.success // empty' >/dev/null \
-                && echo "deleted conflicting CNAME for $NAME" \
-                || echo "::warning title=Cloudflare::could not delete CNAME for $NAME"
-            fi
+            A_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success then (.result[] | select(.type=="A") | .id) else empty end' | head -1)
+
+            # Remove conflicting A record(s) so the CNAME can be created.
             if [ -n "$A_ID" ]; then
+              curl -sS -X DELETE "${AUTH[@]}" \
+                "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$A_ID" \
+                | jq -r '.success // empty' >/dev/null \
+                && echo "deleted conflicting A record for $NAME" \
+                || echo "::warning title=Cloudflare::could not delete A record for $NAME"
+            fi
+
+            if [ -n "$CNAME_ID" ]; then
               METHOD=PUT
-              URL="https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$A_ID"
+              URL="https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$CNAME_ID"
             else
               METHOD=POST
               URL="https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records"
             fi
             BODY=$(curl -sS -X "$METHOD" "${AUTH[@]}" \
               -H "Content-Type: application/json" "$URL" \
-              -d "{\"type\":\"A\",\"name\":\"$NAME\",\"content\":\"$PUBLIC_IP\",\"ttl\":300,\"proxied\":false}")
+              -d "{\"type\":\"CNAME\",\"name\":\"$NAME\",\"content\":\"$TARGET\",\"ttl\":300,\"proxied\":true}")
             if printf '%s' "$BODY" | jq -e '.success' >/dev/null 2>&1; then
-              echo "Cloudflare A record $METHOD: $NAME -> $PUBLIC_IP (grey cloud)"
+              if [ "$METHOD" = PUT ]; then
+                echo "Cloudflare CNAME record updated: $NAME -> $TARGET (proxied=true)"
+              else
+                echo "Cloudflare CNAME record created: $NAME -> $TARGET (proxied=true)"
+              fi
             else
-              echo "::warning title=Cloudflare::A record not updated for $NAME"
+              echo "::warning title=Cloudflare::CNAME record not updated for $NAME (HTTP body below)"
               printf '%s' "$BODY" | head -c 400
               echo
             fi
@@ -316,9 +320,8 @@ jobs:
       # ---------------------------------------------------------------- Cloudflare Tunnel
       # Public ingress: runner dials OUT to Cloudflare over QUIC/HTTPS.
       # Cloudflare forwards client WebSocket connections to localhost:8080.
-      # Works from any GitHub Actions runner with zero inbound ports.
       - name: Start Cloudflare Tunnel (v2ray public entry point)
-        if: env.V2RAY_MODE != 'tunnel' && env.V2RAY_DOMAIN != '' && env.CF_TUNNEL_ID != '' && env.CF_ACCOUNT_ID != '' && env.CF_API_TOKEN != ''
+        if: env.V2RAY_DOMAIN != '' && env.CF_TUNNEL_ID != '' && env.CF_ACCOUNT_ID != '' && env.CF_API_TOKEN != ''
         env:
           DOMAIN: ${{ vars.V2RAY_DOMAIN }}
           CF_TOKEN: ${{ secrets.CF_API_TOKEN }}
@@ -348,7 +351,7 @@ jobs:
           printf '%s' "$TUNNEL_TOKEN" > "$HOME/.cloudflared-tunnel-token"
           chmod 600 "$HOME/.cloudflared-tunnel-token"
 
-          # Write ingress config to Cloudflare API (hostname + WS path -> localhost:PORT)
+          # Write ingress config to Cloudflare API
           INGRESS=$(cat <<EOJ
           {
             "config": {
@@ -408,8 +411,6 @@ jobs:
           UUID: ${{ secrets.V2RAY_UUID }}
           PORT: ${{ env.V2RAY_PORT }}
           WS_PATH: ${{ env.V2RAY_WS_PATH }}
-          PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
-          NODE_IP: ${{ env.NODE_IP }}
         run: |
           # Client connects to Cloudflare on 443/TLS -> Cloudflare Tunnel -> v2ray on localhost:8080.
           CLIENT_PORT=443
