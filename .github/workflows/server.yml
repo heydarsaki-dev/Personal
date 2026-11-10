@@ -155,22 +155,35 @@ jobs:
           CF_ZONE: ${{ secrets.CF_ZONE_ID }}
           PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
         run: |
-          # Get existing A record ID
-          RECORD_ID=$(curl -fsS -H "Authorization: Bearer $CF_TOKEN" \
-            "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records?type=A&name=@&per_page=1" \
-            | jq -r '.result[0].id // empty')
+          # Find the existing A record. Cloudflare's API matches the FQDN (the
+          # UI's "@"), and the body is kept (no -f) so a 404/403 prints the API's
+          # own reason instead of curl's terse error.
+          GET_BODY=$(curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records?type=A&name=$DOMAIN&per_page=1")
+          RECORD_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success and (.result | length) > 0 then .result[0].id else empty end')
           if [ -n "$RECORD_ID" ]; then
-            curl -fsS -X PUT -H "Authorization: Bearer $CF_TOKEN" \
-              -H "Content-Type: application/json" \
-              "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records/$RECORD_ID" \
-              -d "{\"type\":\"A\",\"name\":\"@\",\"content\":\"$PUBLIC_IP\",\"ttl\":300,\"proxied\":false}" \
-              && echo "Cloudflare A record updated to $PUBLIC_IP" || echo "Cloudflare update failed"
+            METHOD=PUT
+            URL="https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records/$RECORD_ID"
           else
-            curl -fsS -X POST -H "Authorization: Bearer $CF_TOKEN" \
-              -H "Content-Type: application/json" \
-              "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records" \
-              -d "{\"type\":\"A\",\"name\":\"@\",\"content\":\"$PUBLIC_IP\",\"ttl\":300,\"proxied\":false}" \
-              && echo "Cloudflare A record created for $PUBLIC_IP" || echo "Cloudflare create failed"
+            METHOD=POST
+            URL="https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records"
+          fi
+          BODY=$(curl -sS -X "$METHOD" -H "Authorization: Bearer $CF_TOKEN" \
+            -H "Content-Type: application/json" "$URL" \
+            -d "{\"type\":\"A\",\"name\":\"$DOMAIN\",\"content\":\"$PUBLIC_IP\",\"ttl\":300,\"proxied\":false}")
+          if printf '%s' "$BODY" | jq -e '.success' >/dev/null 2>&1; then
+            if [ "$METHOD" = PUT ]; then
+              echo "Cloudflare A record updated to $PUBLIC_IP"
+            else
+              echo "Cloudflare A record created for $PUBLIC_IP"
+            fi
+          else
+            # DNS failure must not take the node down (or hide itself): the A
+            # record can be pointed at $PUBLIC_IP by hand, so warn loudly.
+            echo "::warning title=Cloudflare::A record not updated for $DOMAIN (HTTP body below)"
+            echo "method: $METHOD url: $URL"
+            printf '%s' "$BODY" | head -c 400
+            echo
           fi
 
       - name: Install v2ray
@@ -178,8 +191,8 @@ jobs:
         run: |
           # Install v2ray (official script)
           curl -fsSL https://github.com/v2fly/fhs-install-v2ray/raw/master/install-release.sh | sudo bash
-          # Verify
-          /usr/local/bin/v2ray -version
+          # Verify - v2ray uses subcommands ("v2ray version"), not -version flags
+          /usr/local/bin/v2ray version
 
       - name: Generate v2ray config
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
@@ -232,6 +245,8 @@ jobs:
           EOF
           sudo mkdir -p /usr/local/etc/v2ray
           sudo cp /tmp/config.json /usr/local/etc/v2ray/config.json
+          # Validate before anything tries to run it
+          /usr/local/bin/v2ray test -config /usr/local/etc/v2ray/config.json
           echo "v2ray config written to /usr/local/etc/v2ray/config.json"
 
       - name: Start v2ray
