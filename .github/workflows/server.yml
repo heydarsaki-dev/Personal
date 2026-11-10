@@ -56,13 +56,20 @@ jobs:
       # OmniRoute — pinned so the cache key and native module ABI stay stable
       OMNIROUTE_VERSION: "3.8.53"
       OMNIROUTE_PORT: "20128"
-      # v2ray — set V2RAY_DOMAIN and V2RAY_UUID in repo secrets/variables to enable
-      V2RAY_DOMAIN: ${{ vars.V2RAY_DOMAIN || '' }}
+      # v2ray — published on a subdomain so the apex record is left alone.
+      # Change the host here if you move it; the A record lives in the
+      # heydarsaki.bond Cloudflare zone.
+      V2RAY_DOMAIN: ${{ secrets.V2RAY_DOMAIN  || '' }}
       V2RAY_UUID: ${{ secrets.V2RAY_UUID || '' }}
       # Optional: Cloudflare API for automatic DNS A-record updates (recommended)
       # Get token at https://dash.cloudflare.com/profile/api-tokens (Zone > DNS > Edit)
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN || '' }}
       CF_ZONE_ID: ${{ secrets.CF_ZONE_ID || '' }}
+      # When "true" (default) Cloudflare proxies the A record (orange cloud),
+      # so clients reach v2ray through Cloudflare on 443/TLS and the runner
+      # needs no inbound port. When "false" the record is DNS-only (grey cloud)
+      # and clients talk straight to the runner's public IP on 8080.
+      CF_PROXIED: ${{ vars.CF_PROXIED || 'true' }}
       # NicNames API token (NOT used for DNS - their API doesn't support record management)
       NICNAMES_API_TOKEN: ${{ secrets.NICNAMES_API_TOKEN || '' }}
       V2RAY_PORT: "8080"
@@ -94,13 +101,53 @@ jobs:
       - name: Install tailscale
         run: curl -fsSL https://tailscale.com/install.sh | sh
 
+      # apt-get update is the slowest fixed cost before the node is up, and its
+      # output is the same on every run of the same runner image, so the package
+      # index and the fetched .debs ride along in one tarball cache under $HOME
+      # (actions/cache unpacks as the runner user, so it cannot write into
+      # /var/lib/apt itself). The run id makes every run save a fresh entry and
+      # restore-keys picks the newest, so the index does not age forever; when it
+      # has aged anyway, the install step falls back to a real update once.
+      - name: Cache apt index and packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.apt-cache
+          key: apt-${{ runner.os }}-ssh-${{ github.run_id }}
+          restore-keys: |
+            apt-${{ runner.os }}-ssh-
+
       - name: Ensure SSH server is available
         # Tailscale SSH proxies to a local sshd, which is not running on GitHub-hosted runners.
         # Install and start it BEFORE joining, so `tailscale up --ssh` picks it up.
         run: |
+          cache="$HOME/.apt-cache"
+          mkdir -p "$cache"
+          # Warm start: a cached index lets apt resolve the package without
+          # downloading it, and a cached .deb lets it skip the fetch entirely.
+          if [ -f "$cache/lists.tar" ]; then
+            sudo mkdir -p /var/lib/apt/lists
+            sudo tar -C /var/lib/apt/lists -xf "$cache/lists.tar" 2>/dev/null \
+              && echo "restored cached apt index"
+          fi
+          if [ -f "$cache/archives.tar" ]; then
+            sudo mkdir -p /var/cache/apt/archives/partial
+            sudo tar -C /var/cache/apt/archives -xf "$cache/archives.tar" 2>/dev/null \
+              && echo "restored cached .deb packages"
+          fi
           # No -qq here: a silent apt failure shows up much later as a broken SSH hop.
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server
+          install_sshd() {
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server
+          }
+          # A stale index (image bump, mirror roll) fails fast instead of
+          # hanging, so pay for the real update only when the cache is unusable.
+          if ! install_sshd; then
+            echo "cached apt index unusable - running apt-get update"
+            sudo apt-get update
+            install_sshd
+          fi
+          # Hand the freshest index and .debs to the next run.
+          sudo tar -C /var/lib/apt/lists -cf "$cache/lists.tar" . 2>/dev/null || true
+          sudo tar -C /var/cache/apt/archives -cf "$cache/archives.tar" . 2>/dev/null || true
           # Ubuntu ships /etc/ssh/sshd_config (/etc/sshd_config is the RHEL path).
           cfg=$(ls /etc/ssh/sshd_config /etc/sshd_config 2>/dev/null | head -1)
           if [ -n "$cfg" ]; then
@@ -150,10 +197,13 @@ jobs:
           echo "PUBLIC_IP=$PUB_IP" >> "$GITHUB_OUTPUT"
           echo "Runner public IP: $PUB_IP"
 
-      - name: Update DNS A record (Cloudflare)
+      - name: Update Cloudflare DNS A record (apex + www)
+        # Runs every workflow run so the record always points at the current
+        # runner IP. When CF_PROXIED=true it is orange-clouded, so Cloudflare
+        # proxies 443/TLS -> runner:8080/plain.
         if: env.V2RAY_DOMAIN != '' && env.CF_API_TOKEN != ''
         env:
-          DOMAIN: ${{ vars.V2RAY_DOMAIN }}
+          DOMAIN: ${{ env.V2RAY_DOMAIN }}
           CF_TOKEN: ${{ secrets.CF_API_TOKEN }}
           # Optional, only for a Global API Key (37 hex chars); a scoped API
           # Token authenticates with the Bearer header and needs neither.
@@ -162,6 +212,7 @@ jobs:
           # for domains whose zone name differs from DOMAIN.
           CF_ZONE: ${{ secrets.CF_ZONE_ID }}
           PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
+          PROXIED: ${{ env.CF_PROXIED }}
         run: |
           # Resolve the zone from the domain instead of trusting the
           # CF_ZONE_ID secret: a stale/mismatched zone id fails with Cloudflare's
@@ -194,66 +245,106 @@ jobs:
             echo "Cloudflare auth: API Token (Bearer), length ${#CF_TOKEN}"
           fi
 
-          ZONES=$(curl -sS "${AUTH[@]}" \
-            "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN&per_page=50")
-          ZONE_ID=$(printf '%s' "$ZONES" | jq -r --arg d "$DOMAIN" \
-            'if .success and (.result | length) > 0 then (.result[] | select(.name == $d) | .id) else empty end' | head -1)
-          if [ -n "$ZONE_ID" ]; then
-            echo "Zone $DOMAIN resolved through the API: $ZONE_ID"
-          else
+          # vpn.example.com is not a zone, it is a record inside example.com, so
+          # the lookup tries the parent name as well - otherwise a perfectly
+          # valid token looks broken and every run warns about the zone.
+          ZONE_ID=""
+          ZONE_NAME=""
+          ZONES=""
+          ZONE_CANDIDATES="$DOMAIN"
+          case "$DOMAIN" in
+            *.*.*) ZONE_CANDIDATES="$ZONE_CANDIDATES ${DOMAIN#*.}" ;;
+          esac
+          for cand in $ZONE_CANDIDATES; do
+            ZONES=$(curl -sS "${AUTH[@]}" \
+              "https://api.cloudflare.com/client/v4/zones?name=$cand&per_page=50")
+            ZONE_ID=$(printf '%s' "$ZONES" | jq -r --arg d "$cand" \
+              'if .success and (.result | length) > 0 then (.result[] | select(.name == $d) | .id) else empty end' | head -1)
+            if [ -n "$ZONE_ID" ]; then
+              ZONE_NAME=$cand
+              echo "Zone $cand resolved through the API: $ZONE_ID (record: $DOMAIN)"
+              break
+            fi
+          done
+          if [ -z "$ZONE_ID" ]; then
             ZONE_ID=$CF_ZONE
-            echo "::warning title=Cloudflare::could not list zones with this credential - falling back to CF_ZONE_ID"
+            ZONE_NAME="zone from CF_ZONE_ID"
+            echo "::warning title=Cloudflare::no zone visible for [$ZONE_CANDIDATES] - falling back to CF_ZONE_ID"
             echo "zone lookup response:"
             printf '%s' "$ZONES" | head -c 400
             echo
           fi
           if [ -z "$ZONE_ID" ]; then
-            echo "::warning title=Cloudflare::$DOMAIN is not a zone on this account (CF_ZONE_ID fallback empty) - A record left alone, point it at $PUBLIC_IP by hand"
+            echo "::warning title=Cloudflare::no zone found for [$ZONE_CANDIDATES] and CF_ZONE_ID is empty - A record left alone, point $DOMAIN at $PUBLIC_IP by hand"
             echo "zones visible to this credential (names/status only):"
             printf '%s' "$ZONES" | jq -r '.result[]? | "  \(.name)  \(.status)"' | head -20
             exit 0
           fi
-          # Cloudflare's API matches the FQDN (the UI's "@"), and the body is kept
-          # (no -f) so a 404/403 prints the API's own reason, not curl's error.
-          GET_BODY=$(curl -sS "${AUTH[@]}" \
-            "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=A&name=$DOMAIN&per_page=1")
-          RECORD_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success and (.result | length) > 0 then .result[0].id else empty end')
-          if [ -n "$RECORD_ID" ]; then
-            METHOD=PUT
-            URL="https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID"
-          else
-            METHOD=POST
-            URL="https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records"
-          fi
-          BODY=$(curl -sS -X "$METHOD" "${AUTH[@]}" \
-            -H "Content-Type: application/json" "$URL" \
-            -d "{\"type\":\"A\",\"name\":\"$DOMAIN\",\"content\":\"$PUBLIC_IP\",\"ttl\":300,\"proxied\":false}")
-          if printf '%s' "$BODY" | jq -e '.success' >/dev/null 2>&1; then
-            if [ "$METHOD" = PUT ]; then
-              echo "Cloudflare A record updated to $PUBLIC_IP (zone $DOMAIN)"
+          # Cloudflare's API matches the FQDN (the UI's "@"), and the body is
+          # kept (no -f) so a 404/403 prints the API's own reason, not curl's.
+          # Both the apex and www follow the runner IP, so either name works in
+          # a client (with V2RAY_DOMAIN on a subdomain the second name is
+          # www.<subdomain>).
+          for NAME in "$DOMAIN" "www.$DOMAIN"; do
+            GET_BODY=$(curl -sS "${AUTH[@]}" \
+              "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=A&name=$NAME&per_page=1")
+            RECORD_ID=$(printf '%s' "$GET_BODY" | jq -r 'if .success and (.result | length) > 0 then .result[0].id else empty end')
+            if [ -n "$RECORD_ID" ]; then
+              METHOD=PUT
+              URL="https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID"
             else
-              echo "Cloudflare A record created for $PUBLIC_IP (zone $DOMAIN)"
+              METHOD=POST
+              URL="https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records"
             fi
+            BODY=$(curl -sS -X "$METHOD" "${AUTH[@]}" \
+              -H "Content-Type: application/json" "$URL" \
+              -d "{\"type\":\"A\",\"name\":\"$NAME\",\"content\":\"$PUBLIC_IP\",\"ttl\":300,\"proxied\":$PROXIED}")
+            if printf '%s' "$BODY" | jq -e '.success' >/dev/null 2>&1; then
+              if [ "$METHOD" = PUT ]; then
+                echo "Cloudflare A record updated: $NAME -> $PUBLIC_IP (proxied=$PROXIED)"
+              else
+                echo "Cloudflare A record created: $NAME -> $PUBLIC_IP (proxied=$PROXIED)"
+              fi
+            else
+              # DNS failure must not take the node down (or hide itself): the A
+              # record can be pointed at $PUBLIC_IP by hand, so warn loudly and
+              # say which of the three usual causes the error code points at.
+              echo "::warning title=Cloudflare::A record not updated for $NAME (HTTP body below)"
+              echo "method: $METHOD url: $URL"
+              printf '%s' "$BODY" | head -c 400
+              echo
+              ERR=$(printf '%s' "$BODY" | jq -r '(.errors // [])[] | .code' 2>/dev/null | head -1)
+              case "$ERR" in
+                9106|10000)
+                  echo "hint: code $ERR = Cloudflare rejected the credential itself, not the zone. Re-copy CF_API_TOKEN with no quotes/spaces/newlines; if it is a 37-character Global API Key it also needs CF_API_EMAIL (sent as X-Auth-Key, not Bearer); if it was rolled, generate a new token." ;;
+                9107|9109)
+                  echo "hint: code $ERR = the credential is valid but not allowed here. Give the token Zone -> DNS -> Edit for $DOMAIN (and keep Zone -> Zone -> Read if you want the lookup to work)." ;;
+                7003)
+                  echo "hint: code $ERR = the zone id does not belong to this credential, so CF_ZONE_ID points at a zone this account cannot see." ;;
+                *)
+                  echo "hint: code $ERR - see https://developers.cloudflare.com/fundamentals/api/reference/errors/" ;;
+              esac
+            fi
+          done
+
+          # Propagation sanity check (best effort, never fails the step). It only
+          # means something on a grey-cloud record: an orange-cloud record
+          # answers with Cloudflare's anycast IPs, not with $PUBLIC_IP.
+          if [ "$PROXIED" = "true" ]; then
+            echo "skipping the DNS propagation check: proxied=true answers with Cloudflare IPs, not $PUBLIC_IP"
           else
-            # DNS failure must not take the node down (or hide itself): the A
-            # record can be pointed at $PUBLIC_IP by hand, so warn loudly and
-            # say which of the three usual causes the error code points at.
-            echo "::warning title=Cloudflare::A record not updated for $DOMAIN (HTTP body below)"
-            echo "method: $METHOD url: $URL"
-            printf '%s' "$BODY" | head -c 400
-            echo
-            ERR=$(printf '%s' "$BODY" | jq -r '(.errors // [])[] | .code' 2>/dev/null | head -1)
-            case "$ERR" in
-              9106|10000)
-                echo "hint: code $ERR = Cloudflare rejected the credential itself, not the zone. Re-copy CF_API_TOKEN with no quotes/spaces/newlines; if it is a 37-character Global API Key it also needs CF_API_EMAIL (sent as X-Auth-Key, not Bearer); if it was rolled, generate a new token." ;;
-              9107|9109)
-                echo "hint: code $ERR = the credential is valid but not allowed here. Give the token Zone -> DNS -> Edit for $DOMAIN (and keep Zone -> Zone -> Read if you want the lookup to work)." ;;
-              7003)
-                echo "hint: code $ERR = the zone id does not belong to this credential, so CF_ZONE_ID points at a zone this account cannot see." ;;
-              *)
-                echo "hint: code $ERR - see https://developers.cloudflare.com/fundamentals/api/reference/errors/" ;;
-            esac
+            echo "Waiting ~5s for DNS to propagate..."
+            sleep 5
+            for NAME in "$DOMAIN" "www.$DOMAIN"; do
+              RESOLVED=$(dig +short "$NAME" A @1.1.1.1 2>/dev/null | head -1 || true)
+              if [ "$RESOLVED" = "$PUBLIC_IP" ]; then
+                echo "DNS verified: $NAME resolves to $PUBLIC_IP"
+              else
+                echo "::notice title=Cloudflare::DNS not yet verified for $NAME (got $RESOLVED, expected $PUBLIC_IP) - may still be propagating"
+              fi
+            done
           fi
+
       - name: Install v2ray
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
         run: |
@@ -265,7 +356,7 @@ jobs:
       - name: Generate v2ray config
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
         env:
-          DOMAIN: ${{ vars.V2RAY_DOMAIN }}
+          DOMAIN: ${{ env.V2RAY_DOMAIN }}
           UUID: ${{ secrets.V2RAY_UUID }}
           PORT: ${{ env.V2RAY_PORT }}
           WS_PATH: ${{ env.V2RAY_WS_PATH }}
@@ -328,6 +419,7 @@ jobs:
           # Validate before anything tries to run it
           /usr/local/bin/v2ray test -config /usr/local/etc/v2ray/config.json
           echo "v2ray config written to /usr/local/etc/v2ray/config.json"
+          echo "v2ray listens on port ${PORT} (Cloudflare proxies 443/TLS -> ${PORT} when CF_PROXIED=true)"
 
       - name: Start v2ray
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
@@ -358,33 +450,50 @@ jobs:
       - name: Publish v2ray connection info
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
         env:
-          DOMAIN: ${{ vars.V2RAY_DOMAIN }}
+          DOMAIN: ${{ env.V2RAY_DOMAIN }}
           UUID: ${{ secrets.V2RAY_UUID }}
           PORT: ${{ env.V2RAY_PORT }}
           WS_PATH: ${{ env.V2RAY_WS_PATH }}
           PUBLIC_IP: ${{ steps.public-ip.outputs.PUBLIC_IP }}
           NODE_IP: ${{ env.NODE_IP }}
+          PROXIED: ${{ env.CF_PROXIED }}
         run: |
-          # Build the VMess link once, then show it twice: as plain text in the
-          # step log (readable while the run is going, which is what you are
-          # looking at) and as markdown in the run summary. Previously every
-          # echo went straight into $GITHUB_STEP_SUMMARY, so this step's log was
-          # empty and looked like it had printed nothing at all.
+          # When CF_PROXIED=true the client talks TLS to Cloudflare on 443 and
+          # Cloudflare forwards it to v2ray over plain HTTP on the runner,
+          # so the client-side link is 443/tls even though v2ray itself listens
+          # on ${PORT} without TLS. When CF_PROXIED=false the client talks
+          # straight to the runner, so the link is ${PORT}/none.
+          if [ "$PROXIED" = "true" ]; then
+            CLIENT_PORT=443
+            CLIENT_TLS=tls
+            CLIENT_SNI="$DOMAIN"
+            CLIENT_HOST="$DOMAIN"
+            CLIENT_NOTE="ws over TLS on 443 via Cloudflare (v2ray listens on ${PORT} on the runner)"
+          else
+            CLIENT_PORT="$PORT"
+            CLIENT_TLS=""
+            CLIENT_SNI="$DOMAIN"
+            CLIENT_HOST="$DOMAIN"
+            CLIENT_NOTE="ws, no TLS (direct to runner IP on ${PORT})"
+          fi
+
+          # Built once, shown three times: masked-safe plain text in this step's
+          # log, unmodified in the artifact file, and in the run summary.
           VMESS_JSON=$(cat <<EOJ
           {
             "v": "2",
             "ps": "$DOMAIN",
             "add": "$DOMAIN",
-            "port": "$PORT",
+            "port": "$CLIENT_PORT",
             "id": "$UUID",
             "aid": "0",
             "scy": "auto",
             "net": "ws",
             "type": "none",
-            "host": "$DOMAIN",
+            "host": "$CLIENT_HOST",
             "path": "$WS_PATH",
-            "tls": "",
-            "sni": "$DOMAIN",
+            "tls": "$CLIENT_TLS",
+            "sni": "$CLIENT_SNI",
             "alpn": ""
           }
           EOJ
@@ -393,12 +502,13 @@ jobs:
 
           echo "================ v2ray connection info ================"
           echo "domain       : $DOMAIN"
+          echo "mode         : proxied=$PROXIED"
           echo "public IP    : $PUBLIC_IP   (the A record must point here)"
           echo "tailscale IP : $NODE_IP"
-          echo "port         : $PORT/tcp"
+          echo "port         : $CLIENT_PORT/tcp  (client side)"
           echo "uuid         : $UUID"
           echo "ws path      : $WS_PATH"
-          echo "network      : ws | security: none (Cloudflare proxy for TLS)"
+          echo "network      : ws | security: $CLIENT_TLS"
           echo ""
           echo "The vmess:// link is deliberately not printed here: it carries the"
           echo "UUID, so GitHub masks part of it and the base64 copy becomes"
@@ -407,18 +517,17 @@ jobs:
           echo "  - the 'v2ray-connection' artifact of this run (plain text)"
           echo "======================================================"
 
-          # A file is not run through log masking, so the artifact below is the
-          # only place the link survives intact and stays copy-pasteable.
           CONN_FILE="$RUNNER_TEMP/v2ray-connection.txt"
           {
             echo "v2ray connection info"
             echo "domain       : $DOMAIN"
+            echo "mode         : proxied=$PROXIED"
             echo "public IP    : $PUBLIC_IP   (the A record must point here)"
             echo "tailscale IP : $NODE_IP"
-            echo "port         : $PORT/tcp"
+            echo "port         : $CLIENT_PORT/tcp  (client side)"
             echo "uuid         : $UUID"
             echo "ws path      : $WS_PATH"
-            echo "network      : ws | security: none (Cloudflare proxy for TLS)"
+            echo "network      : ws | security: $CLIENT_TLS"
             echo ""
             echo "vmess link (import into V2RayN / v2rayNG / Clash):"
             echo "$VMESS_LINK"
@@ -430,18 +539,19 @@ jobs:
             echo ""
             echo "**Public IP:** \`$PUBLIC_IP\`"
             echo "**Tailscale IP:** \`$NODE_IP\`"
-            echo "**Domain:** \`$DOMAIN\` (point A record to \`$PUBLIC_IP\` if not auto-updated)"
-            echo "**Port:** \`$PORT\`"
+            echo "**Domain:** \`$DOMAIN\` (A record auto-updated to \`$PUBLIC_IP\` every run)"
+            echo "**Port:** \`$CLIENT_PORT\`"
             echo "**UUID:** \`$UUID\`"
             echo "**WebSocket Path:** \`$WS_PATH\`"
             echo "**Network:** ws"
-            echo "**Security:** none (use Cloudflare proxy for TLS, or add TLS certs)"
+            echo "**Security:** \`$CLIENT_TLS\`"
+            echo ""
+            echo "> $CLIENT_NOTE"
             echo ""
             echo "#### VMess link (for V2RayN, v2rayNG, Clash, etc.)"
             echo "\`$VMESS_LINK\`"
             echo ""
-            echo "> **Note:** The runner IP changes every run. Update your DNS A record for \`$DOMAIN\` to \`$PUBLIC_IP\` or use the VMess link with \`add\` set to the current IP."
-            echo "> For TLS, put Cloudflare in front (orange cloud) or add certs to v2ray config."
+            echo "> **Note:** The runner IP changes every run. The Cloudflare A record for \`$DOMAIN\` (and www) is auto-updated to \`$PUBLIC_IP\` at the start of each run."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload v2ray connection info
