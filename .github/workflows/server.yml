@@ -42,11 +42,11 @@ jobs:
       TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
       HERMES_BACKUP_TOKEN: ${{ secrets.HERMES_BACKUP_TOKEN }}
       HERMES_BACKUP_REPO: heydarsaki-dev/HermesBackup
-      HERMES_MODEL: minimaxai/minimax-m3.1-flash
+      HERMES_MODEL: auto
       NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
       HERMES_RESTART_DELAY: 10
       OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
-      OMNIROUTE_MODEL: ${{ vars.OMNIROUTE_MODEL || 'MyCombo' }}
+      OMNIROUTE_MODEL: ${{ vars.OMNIROUTE_MODEL || 'auto' }}
       OMNIROUTE_VERSION: "3.8.53"
       OMNIROUTE_PORT: "20128"
       # v2ray — the DNS name clients use, published as a subdomain so the apex
@@ -629,6 +629,65 @@ jobs:
           else
             echo "::warning title=OmniRoute::not healthy after 180s"
           fi
+
+      # ---------------------------------------------------------------- Freebuff
+      - name: Cache Freebuff
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.npm
+            ~/.config/manicode
+            ~/.config/freebuff
+          key: freebuff-${{ runner.os }}-v1
+          restore-keys: |
+            freebuff-${{ runner.os }}-v1-
+
+      - name: Install Freebuff
+        continue-on-error: true
+        run: |
+          sudo npm install -g freebuff
+          freebuff --version
+
+      - name: Configure Freebuff BYOK (OmniRoute)
+        continue-on-error: true
+        run: |
+          mkdir -p "$HOME/.config/freebuff/byok" "$HOME/.config/manicode"
+
+          cat > "$HOME/.config/freebuff/byok/connections.json" <<EOF
+          [
+            {
+              "id": "omniroute-local",
+              "revision": 1,
+              "name": "omniroute-local",
+              "provider": "openai-compatible",
+              "model": "auto/best-coding",
+              "baseUrl": "http://127.0.0.1:${OMNIROUTE_PORT}/v1",
+              "contextWindow": 128000,
+              "maxOutputTokens": 32000,
+              "credentialRef": "env:OMNIROUTE_API_KEY",
+              "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+              "updatedAt": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+            }
+          ]
+          EOF
+
+          cat > "$HOME/.config/manicode/settings.json" <<EOF
+          {
+            "mode": "DEFAULT",
+            "adsEnabled": true,
+            "byokConnection": {
+              "id": "omniroute-local",
+              "revision": 1,
+              "provider": "openai-compatible",
+              "model": "auto/best-coding"
+            }
+          }
+          EOF
+
+          # Make the key available for freebuff runs in this and future sessions
+          echo "OMNIROUTE_API_KEY=$OMNIROUTE_API_KEY" >> "$HOME/.bashrc"
+          echo "OMNIROUTE_API_KEY=$OMNIROUTE_API_KEY" >> "$GITHUB_ENV"
 
       # ---------------------------------------------------------------- Hermes
       - name: Install Hermes Agent
