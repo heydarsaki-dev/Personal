@@ -61,6 +61,12 @@ jobs:
       CF_TUNNEL_ID: ${{ secrets.CF_TUNNEL_ID || '' }}
       V2RAY_PORT: "8080"
       V2RAY_WS_PATH: "/v2ray"
+      # SearXNG — self-hosted metasearch that backs Hermes' web_search tool.
+      # Pinned version so the cached install and the source tree never drift.
+      SEARXNG_REPO: https://github.com/searxng/searxng.git
+      SEARXNG_ROOT: /home/runner/.searxng
+      SEARXNG_PORT: "8888"
+      SEARXNG_URL: http://127.0.0.1:8888
       # Wall-clock budget for the whole job. The Keep alive step measures the
       # remaining time from this budget (counted from the job start), so the
       # workflow always finishes before timeout-minutes and still has time for
@@ -498,6 +504,146 @@ jobs:
           retention-days: 1
           if-no-files-found: warn
 
+      # ---------------------------------------------------------------- SearXNG
+      # Self-hosted metasearch that backs the Hermes web_search tool. Everything
+      # lives under $SEARXNG_ROOT (source tree + venv + settings.yml) so a single
+      # actions/cache entry carries the whole install between runs; a cache hit
+      # skips the git clone and the pip install entirely.
+      #
+      # SearXNG's setup.py imports the package at build time (which pulls in the
+      # full runtime deps), so we do NOT "pip install searxng". We install
+      # requirements.txt into a venv and run the source tree directly with
+      # `python -m searx.webapp`, which is the same entry point the package's
+      # console script uses.
+      #
+      # Hermes reaches it at SEARXNG_URL=http://127.0.0.1:8888 and needs
+      # format=json enabled in settings.yml (the upstream default is html-only).
+
+      - name: Cache SearXNG
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: ~/.searxng
+          key: searxng-${{ runner.os }}-py312-v1
+          restore-keys: |
+            searxng-${{ runner.os }}-py312-
+
+      - name: Install SearXNG
+        continue-on-error: true
+        run: |
+          ROOT="$SEARXNG_ROOT"
+          mkdir -p "$ROOT"
+          # Cache hit = venv that imports the deps AND a source tree with webapp.py.
+          # A venv carried across a base-image python bump fails the import check
+          # and is rebuilt here, so the cache self-heals instead of wedging.
+          if [ -x "$ROOT/venv/bin/python" ] \
+             && [ -f "$ROOT/src/searx/webapp.py" ] \
+             && "$ROOT/venv/bin/python" -c "import flask, msgspec, lxml, yaml" 2>/dev/null; then
+            echo "SearXNG restored from cache"
+          else
+            echo "SearXNG cache miss - installing"
+            rm -rf "$ROOT/venv" "$ROOT/src"
+            git clone --depth 1 -q "$SEARXNG_REPO" "$ROOT/src"
+            # /usr/bin/python3 is the runner's system 3.12; SearXNG needs >= 3.10.
+            # Absolute path so the Hermes-bundled 3.14 on $PATH is not picked up.
+            /usr/bin/python3 -m venv "$ROOT/venv"
+            "$ROOT/venv/bin/pip" install -U pip wheel
+            "$ROOT/venv/bin/pip" install -r "$ROOT/src/requirements.txt"
+          fi
+          "$ROOT/venv/bin/python" -c "import flask, msgspec, lxml, yaml; print('SearXNG deps OK')"
+
+      - name: Generate SearXNG settings
+        continue-on-error: true
+        run: |
+          ROOT="$SEARXNG_ROOT"
+          # Only when absent, so the cached secret_key stays stable across runs.
+          if [ -f "$ROOT/settings.yml" ]; then
+            echo "SearXNG settings restored from cache"
+            exit 0
+          fi
+          SECRET=$(/usr/bin/python3 -c "import secrets; print(secrets.token_hex(32))")
+          cat > "$ROOT/settings.yml" <<EOF
+          # Minimal instance config, merged over searx/settings.yml defaults.
+          use_default_settings: true
+
+          general:
+            instance_name: "Hermes SearXNG"
+
+          search:
+            # The Hermes searxng backend calls /search?format=json. Upstream
+            # defaults to html-only, which returns 403 for the JSON API.
+            formats:
+              - html
+              - json
+            safe_search: 0
+            autocomplete: ""
+            default_lang: "auto"
+
+          server:
+            bind_address: "127.0.0.1"
+            port: ${SEARXNG_PORT}
+            secret_key: "$SECRET"
+            limiter: false
+            public_instance: false
+            image_proxy: false
+            method: "GET"
+
+          outgoing:
+            request_timeout: 6.0
+            max_request_timeout: 10.0
+            enable_http2: true
+
+          engines:
+            - name: google
+              engine: google
+              shortcut: gg
+              disabled: false
+              timeout: 10.0
+            - name: bing
+              engine: bing
+              shortcut: b
+              disabled: false
+              timeout: 10.0
+            - name: duckduckgo
+              engine: duckduckgo
+              shortcut: ddg
+              disabled: false
+              timeout: 10.0
+          EOF
+          echo "SearXNG settings written"
+
+      - name: Start SearXNG
+        continue-on-error: true
+        run: |
+          cat > "$HOME/run-searxng.sh" <<'SH'
+          #!/usr/bin/env bash
+          export SEARXNG_SETTINGS_PATH="$HOME/.searxng/settings.yml"
+          cd "$HOME/.searxng/src" || exit 1
+          while true; do
+            "$HOME/.searxng/venv/bin/python" -m searx.webapp >> "$HOME/searxng.log" 2>&1
+            echo "[$(date -u +%FT%TZ)] searxng exited ($?) - restart in 10s" >> "$HOME/searxng.log"
+            sleep 10
+          done
+          SH
+          chmod +x "$HOME/run-searxng.sh"
+          setsid nohup "$HOME/run-searxng.sh" >/dev/null 2>&1 &
+          echo $! > "$HOME/searxng.pid"
+
+          ready=0
+          for i in $(seq 1 60); do
+            if curl -fsS "$SEARXNG_URL/search?q=ok&format=json" >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" = 1 ]; then
+            echo "SearXNG is serving JSON on ${SEARXNG_URL#http://}"
+          else
+            echo "::warning title=SearXNG::did not answer /search?format=json within 60s"
+            tail -20 "$HOME/searxng.log" 2>/dev/null || true
+          fi
+
       # ---------------------------------------------------------------- Restore
       - name: Restore state from backup
         id: restore
@@ -590,6 +736,39 @@ jobs:
           else
             echo "::warning title=OmniRoute::password reset failed (no database yet?)"
           fi
+
+      - name: Patch OmniRoute for model footer
+        run: |
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const file = path.join(process.env.HOME, "omniroute-app/node_modules/omniroute/open-sse/handlers/chatCore/nonStreamingResponse.ts");
+            if (fs.existsSync(file)) {
+              let content = fs.readFileSync(file, "utf8");
+              const target = "if (echoModel) echoModelInObject(translatedResponse, echoModel);";
+              const addition = "\\n    if (responseModel && typeof translatedResponse === \\\"object\\\" && translatedResponse !== null) {\\n      (translatedResponse as Record<string, unknown>).served_model = responseModel;\\n    }";
+              if (!content.includes("served_model = responseModel")) {
+                content = content.replace(target, target + addition);
+                fs.writeFileSync(tsFile, content);
+                console.log("Patched nonStreamingResponse.ts (non-streaming footer)");
+              } else {
+                console.log("nonStreamingResponse.ts already patched");
+              }
+            }
+            const chunksDir = path.join(process.env.HOME, "omniroute-app/node_modules/omniroute/dist/.build/next/server/chunks");
+            if (fs.existsSync(chunksDir)) {
+              const fb = ["try{let _fm=\"[model: \"+ex+\"]\",_fc={id:\"chatcmpl-omniroute-footer\",","object:\"chat.completion.chunk\",created:Math.floor(Date.now()/1e3),","model:ex,choices:[{index:0,delta:{content:\"\\\\n\\\\n\"+_fm},finish_reason:null}]},","_fo=\"data: \"+JSON.stringify(_fc)+\"\\\\n\\\\n\";","eE?.appendConvertedChunk?.(_fo),eB(e,tN.encode(_fo)),tO.push(_fc)}catch{}"].join("");
+              const anchors = [
+                ["}if(await tG(e,eQ),tC=!0,ez){tO.push({done:!0});let t=\\\"data: [DONE]\\\\\\\\n\\\\\\\\n\\\";eE?.appendConvertedChunk?.(t),eB(e,tN.encode(t))}","}if(await tG(e,eQ),tC=!0,ez){"+fb+"tO.push({done:!0});let t=\\\"data: [DONE]\\\\\\\\n\\\\\\\\n\\\";eE?.appendConvertedChunk?.(t),eB(e,tN.encode(t))}"],
+                ["}if(await tB(e,eK),tC=!0,eV){tO.push({done:!0});let t=\\\"data: [DONE]\\\\\\\\n\\\\\\\\n\\\";eE?.appendConvertedChunk?.(t),eB(e,tN.encode(t))}","}if(await tB(e,eK),tC=!0,eV){"+fb+"tO.push({done:!0});let t=\\\"data: [DONE]\\\\\\\\n\\\\\\\\n\\\";eE?.appendConvertedChunk?.(t),eB(e,tN.encode(t))}"]
+              ];
+              let count=0;
+              for (const fname of fs.readdirSync(chunksDir)) {
+                const fpath=path.join(chunksDir,fname);
+                try { if (!fs.statSync(fpath).isFile()) continue; let d=fs.readFileSync(fpath,"utf8"); if (d.includes("chatcmpl-omniroute-footer")) continue; let patched=false; for (const [o,n] of anchors) { if (d.includes(o)) { d=d.replace(o,n); patched=true; break; } } if (patched) { fs.writeFileSync(fpath,d); count++; console.log("Patched chunk:",fname); } } catch{} }
+              console.log("Patched "+count+" streaming chunks");
+            }
+          '
 
       - name: Start OmniRoute
         continue-on-error: true
@@ -744,6 +923,34 @@ jobs:
           ~/.local/bin/hermes config set model.api_key "$OMNIROUTE_API_KEY"
           ~/.local/bin/hermes config set model.default "auto"
 
+          # ---- SearXNG as the web_search backend -------------------------------
+          # The endpoint is not a secret, but SEARXNG_URL is read from the env
+          # layer, so it belongs in .env alongside the other provider endpoints.
+          upsert SEARXNG_URL "$SEARXNG_URL"
+          ~/.local/bin/hermes config set web.backend searxng
+
+          # The web toolset must be *allowed* in two places or the tool is
+          # filtered out of the agent even though the backend is healthy:
+          #   1. platform_toolsets.cli is an allowlist (setup wizard writes it)
+          #   2. agent.disabled_toolsets is a denylist
+          # Both edits are idempotent and preserve the user's other choices.
+          cfg_get() { ~/.local/bin/hermes config get "$1" 2>/dev/null; }
+
+          if ! cfg_get platform_toolsets.cli | grep -qx ' *- *web'; then
+            cur=$(cfg_get platform_toolsets.cli | sed -n 's/^ *- *//p' | paste -sd, -)
+            ~/.local/bin/hermes config set platform_toolsets.cli "[${cur:+$cur,}web]"
+          fi
+
+          if cfg_get agent.disabled_toolsets | sed -n 's/^ *- *//p' | grep -qx web; then
+            rest=$(cfg_get agent.disabled_toolsets | sed -n 's/^ *- *//p' | grep -vx web | paste -sd, -)
+            if [ -n "$rest" ]; then
+              ~/.local/bin/hermes config set agent.disabled_toolsets \
+                "[$(printf '%s' "$rest" | sed 's/,/","/g' | sed 's/^/"/;s/$/"/')]"
+            else
+              ~/.local/bin/hermes config set agent.disabled_toolsets '[]'
+            fi
+          fi
+
           if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
             upsert TELEGRAM_BOT_TOKEN     "$TELEGRAM_BOT_TOKEN"
             upsert TELEGRAM_ALLOWED_USERS "$TELEGRAM_USER_ID"
@@ -771,6 +978,20 @@ jobs:
             sleep 1
           done
 
+      - name: Verify Hermes web_search (SearXNG)
+        continue-on-error: true
+        run: |
+          echo "web_search backend:"
+          ~/.local/bin/hermes doctor 2>&1 | grep -iE "web (search|extract)" || true
+          code=$(curl -sS -o /tmp/sx.json -w '%{http_code}' \
+            "$SEARXNG_URL/search?q=searxng&format=json" || echo 000)
+          count=$(jq -r '.results | length' /tmp/sx.json 2>/dev/null || echo 0)
+          if [ "$code" = "200" ] && [ "${count:-0}" -gt 0 ]; then
+            echo "web_search OK - SearXNG returned ${count} results"
+          else
+            echo "::warning title=SearXNG::JSON search returned HTTP $code with ${count} results"
+          fi
+
       - name: Publish address
         continue-on-error: true
         run: |
@@ -783,6 +1004,7 @@ jobs:
             echo "SSH: \`tailscale ssh runner@$NODE_NAME\`"
             echo ""
             echo "OmniRoute dashboard: http://$NODE_IP:$OMNIROUTE_PORT  _(tailnet only)_"
+            echo "SearXNG (Hermes web_search backend): http://$NODE_IP:$SEARXNG_PORT  _(tailnet only)_"
             echo "> v2ray is reachable via Cloudflare Tunnel at $V2RAY_DOMAIN:443"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -810,9 +1032,10 @@ jobs:
           while [ $SECONDS -lt $END ]; do
             tailscale status >/dev/null 2>&1 || echo "tailscaled hiccup"
             omni=$(curl -fsS "http://127.0.0.1:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1 && echo ok || echo down)
+            sx=$(curl -fsS "$SEARXNG_URL/search?q=ping&format=json" >/dev/null 2>&1 && echo ok || echo down)
             cf=$(grep -c "Registered tunnel connection" "$HOME/cloudflared.log" 2>/dev/null || true)
             cf=${cf:-0}
-            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | omniroute $omni | cloudflared conns=$cf"
+            echo "[$(date -u +%H:%M:%S)] up as $NODE_IP | omniroute $omni | searxng $sx | cloudflared conns=$cf"
             sleep 60
           done
 
@@ -850,6 +1073,17 @@ jobs:
           fi
           pkill -f 'run-cloudflared.sh' 2>/dev/null || true
           pkill -f 'cloudflared tunnel' 2>/dev/null || true
+
+      - name: Stop SearXNG
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f "$HOME/searxng.pid" ]; then
+            kill -- -"$(cat "$HOME/searxng.pid")" 2>/dev/null || true
+            kill "$(cat "$HOME/searxng.pid")" 2>/dev/null || true
+          fi
+          pkill -f 'run-searxng.sh' 2>/dev/null || true
+          pkill -f 'searx.webapp' 2>/dev/null || true
 
       - name: Back up state to GitHub
         if: always()
