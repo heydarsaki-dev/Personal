@@ -8,7 +8,9 @@ on:
         required: false
         default: "350"
   schedule:
-    - cron: "0 */5 * * *"      # fresh node every 5h, replaces the dying one
+    # Every 6h: the job budget below is 335 min, so the next scheduled run
+    # (360 min later) cannot cancel this one through the concurrency group.
+    - cron: "0 */6 * * *"      # fresh node every 6h, replaces the dying one
 
 # Tailnet policy required for auto-approved exit nodes (Access controls / policy.json):
 #   "tagOwners":      { "tag:gh-exit": ["autogroup:admin"] },
@@ -51,7 +53,7 @@ jobs:
       # record is left alone. The repository variable wins when it is set; the
       # literal is a fallback so an empty variable can never silently switch the
       # whole v2ray block off (which is what skips those steps).
-      V2RAY_DOMAIN: ${{ vars.V2RAY_DOMAIN || '' }}
+      V2RAY_DOMAIN: ${{ vars.V2RAY_DOMAIN || 'vpn.heydarsaki.bond' }}
       V2RAY_UUID: ${{ secrets.V2RAY_UUID || '' }}
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN || '' }}
       CF_ZONE_ID: ${{ secrets.CF_ZONE_ID || '' }}
@@ -59,8 +61,17 @@ jobs:
       CF_TUNNEL_ID: ${{ secrets.CF_TUNNEL_ID || '' }}
       V2RAY_PORT: "8080"
       V2RAY_WS_PATH: "/v2ray"
+      # Wall-clock budget for the whole job. The Keep alive step measures the
+      # remaining time from this budget (counted from the job start), so the
+      # workflow always finishes before timeout-minutes and still has time for
+      # the stop/backup steps. A cancelled job saves no cache.
+      JOB_TIMEOUT_MINUTES: "335"
     steps:
+      - name: Record job start
+        run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Enable IP forwarding
+        continue-on-error: true
         run: |
           sudo sysctl -w net.ipv4.ip_forward=1
           sudo sysctl -w net.ipv6.conf.all.forwarding=1
@@ -68,6 +79,7 @@ jobs:
           echo 'net.ipv6.conf.all.forwarding=1' | sudo tee -a /etc/sysctl.conf
 
       - name: Delete old tailnet nodes
+        continue-on-error: true
         run: |
           token=$(curl -fsSL -d "client_id=$TS_CLIENT_ID" \
                           -d "client_secret=$TS_CLIENT_SECRET" \
@@ -84,10 +96,12 @@ jobs:
               done
 
       - name: Install tailscale
+        continue-on-error: true
         run: curl -fsSL https://tailscale.com/install.sh | sh
 
       - name: Cache apt index and packages
         uses: actions/cache@v4
+        continue-on-error: true
         with:
           path: ~/.apt-cache
           key: apt-${{ runner.os }}-ssh-${{ github.run_id }}
@@ -96,6 +110,7 @@ jobs:
 
 
       - name: Ensure SSH server is available
+        continue-on-error: true
         run: |
           cache="$HOME/.apt-cache"
           mkdir -p "$cache"
@@ -148,6 +163,7 @@ jobs:
 
       - name: Get public IP
         id: public-ip
+        continue-on-error: true
         run: |
           PUB_IP=$(curl -fsS https://api.ipify.org || curl -fsS https://ifconfig.me || curl -fsS https://ipinfo.io/ip)
           echo "PUBLIC_IP=$PUB_IP" >> "$GITHUB_OUTPUT"
@@ -155,6 +171,7 @@ jobs:
 
       - name: Update Cloudflare DNS CNAME record (tunnel target)
         if: env.V2RAY_DOMAIN != '' && env.CF_API_TOKEN != '' && env.CF_TUNNEL_ID != ''
+        continue-on-error: true
         env:
           DOMAIN: ${{ env.V2RAY_DOMAIN }}
           CF_TOKEN: ${{ secrets.CF_API_TOKEN }}
@@ -244,12 +261,14 @@ jobs:
 
       - name: Install v2ray
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
+        continue-on-error: true
         run: |
           curl -fsSL https://github.com/v2fly/fhs-install-v2ray/raw/master/install-release.sh | sudo bash
           /usr/local/bin/v2ray version
 
       - name: Generate v2ray config
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
+        continue-on-error: true
         env:
           DOMAIN: ${{ env.V2RAY_DOMAIN }}
           UUID: ${{ secrets.V2RAY_UUID }}
@@ -293,6 +312,7 @@ jobs:
 
       - name: Start v2ray
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
+        continue-on-error: true
         run: |
           cat > "$HOME/run-v2ray.sh" <<'SH'
           #!/usr/bin/env bash
@@ -317,6 +337,7 @@ jobs:
       # ---------------------------------------------------------------- Cloudflare Tunnel
       - name: Start Cloudflare Tunnel (v2ray public entry point)
         if: env.V2RAY_DOMAIN != '' && env.CF_TUNNEL_ID != '' && env.CF_ACCOUNT_ID != '' && env.CF_API_TOKEN != ''
+        continue-on-error: true
         env:
           DOMAIN: ${{ env.V2RAY_DOMAIN }}
           CF_TOKEN: ${{ secrets.CF_API_TOKEN }}
@@ -398,6 +419,7 @@ jobs:
 
       - name: Publish v2ray connection info
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
+        continue-on-error: true
         env:
           DOMAIN: ${{ env.V2RAY_DOMAIN }}
           UUID: ${{ secrets.V2RAY_UUID }}
@@ -470,6 +492,7 @@ jobs:
       - name: Upload v2ray connection info
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: v2ray-connection
           path: ${{ runner.temp }}/v2ray-connection.txt
@@ -479,6 +502,7 @@ jobs:
       # ---------------------------------------------------------------- Restore
       - name: Restore state from backup
         id: restore
+        continue-on-error: true
         run: |
           if [ -z "$HERMES_BACKUP_TOKEN" ]; then
             echo "HERMES_BACKUP_TOKEN not set - starting from scratch"
@@ -503,6 +527,7 @@ jobs:
 
       - name: Cache Hermes runtime
         uses: actions/cache@v4
+        continue-on-error: true
         with:
           path: |
             ~/.hermes/tools
@@ -514,11 +539,13 @@ jobs:
 
       - name: Set up Node.js for OmniRoute
         uses: actions/setup-node@v4
+        continue-on-error: true
         with:
           node-version: "24"
 
       - name: Cache npm downloads
         uses: actions/cache@v4
+        continue-on-error: true
         with:
           path: ~/.npm
           key: npm-${{ runner.os }}-node24-${{ env.OMNIROUTE_VERSION }}
@@ -527,11 +554,13 @@ jobs:
 
       - name: Cache OmniRoute install
         uses: actions/cache@v4
+        continue-on-error: true
         with:
           path: ~/omniroute-app
           key: omniroute-${{ runner.os }}-node24-${{ env.OMNIROUTE_VERSION }}
 
       - name: Install OmniRoute
+        continue-on-error: true
         run: |
           bin="$HOME/omniroute-app/node_modules/.bin/omniroute"
           if [ -x "$bin" ]; then
@@ -564,6 +593,7 @@ jobs:
           fi
 
       - name: Start OmniRoute
+        continue-on-error: true
         run: |
           mkdir -p "$HOME/.omniroute" "$HOME/omniroute-logs"
           export DATA_DIR="$HOME/.omniroute"
@@ -602,6 +632,7 @@ jobs:
 
       # ---------------------------------------------------------------- Hermes
       - name: Install Hermes Agent
+        continue-on-error: true
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
             | bash -s -- --non-interactive --skip-browser --skip-computer-use
@@ -610,11 +641,13 @@ jobs:
 
       - name: Import previous Hermes state
         if: env.RESTORE_ZIP != ''
+        continue-on-error: true
         run: |
           ~/.local/bin/hermes import "$RESTORE_ZIP" --force
           rm -f "$RESTORE_ZIP"
 
       - name: Configure Hermes
+        continue-on-error: true
         run: |
           mkdir -p "$HOME/.hermes"
           touch "$HOME/.hermes/.env"
@@ -644,6 +677,7 @@ jobs:
           ~/.local/bin/hermes config check || true
 
       - name: Start Hermes gateway
+        continue-on-error: true
         run: |
           cat > "$HOME/run-hermes-gateway.sh" <<'SH'
           #!/usr/bin/env bash
@@ -663,6 +697,7 @@ jobs:
           done
 
       - name: Publish address
+        continue-on-error: true
         run: |
           {
             echo "### VPN node is up"
@@ -677,8 +712,26 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep alive
+        continue-on-error: true
         run: |
-          END=$((SECONDS + RUN_MINUTES * 60 - 300))
+          # Anchor the loop to the JOB START, not to this step: SECONDS resets
+          # to 0 here, so the old formula ignored the setup time and the job
+          # could run past timeout-minutes and be cancelled (a cancelled job
+          # saves no cache). WAIT = min(requested runtime, remaining budget),
+          # so the workflow always ends with time left for the stop/backup
+          # steps and therefore finishes successfully.
+          NOW=$(date +%s)
+          ELAPSED=$((NOW - JOB_START_EPOCH))
+          BUDGET=$((JOB_TIMEOUT_MINUTES * 60))
+          REMAIN=$((BUDGET - ELAPSED))
+          REQUESTED=$((RUN_MINUTES * 60 - 300))
+          if [ "$REQUESTED" -lt "$REMAIN" ]; then WAIT=$REQUESTED; else WAIT=$REMAIN; fi
+          if [ "$WAIT" -lt 60 ]; then
+            echo "::warning title=Timing::only ${REMAIN}s of job budget left - skipping keep-alive"
+            exit 0
+          fi
+          echo "keeping alive for $((WAIT / 60)) min (elapsed $((ELAPSED / 60)) min, budget ${JOB_TIMEOUT_MINUTES} min)"
+          END=$((SECONDS + WAIT))
           while [ $SECONDS -lt $END ]; do
             tailscale status >/dev/null 2>&1 || echo "tailscaled hiccup"
             omni=$(curl -fsS "http://127.0.0.1:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1 && echo ok || echo down)
@@ -808,4 +861,5 @@ jobs:
 
       - name: Leave tailnet
         if: always()
+        continue-on-error: true
         run: sudo tailscale logout || true
