@@ -108,7 +108,6 @@ jobs:
           restore-keys: |
             apt-${{ runner.os }}-ssh-
 
-
       - name: Ensure SSH server is available
         continue-on-error: true
         run: |
@@ -657,11 +656,11 @@ jobs:
           cat > "$HOME/.config/freebuff/byok/connections.json" <<EOF
           [
             {
-              "id": "omniroute-local",
+              "id": "a1c7f3e2-9b4d-4e8a-b6f1-2d5c8e0a3b47",
               "revision": 1,
               "name": "omniroute-local",
               "provider": "openai-compatible",
-              "model": "auto/best-coding",
+              "model": "auto",
               "baseUrl": "http://127.0.0.1:${OMNIROUTE_PORT}/v1",
               "contextWindow": 128000,
               "maxOutputTokens": 32000,
@@ -677,10 +676,10 @@ jobs:
             "mode": "DEFAULT",
             "adsEnabled": true,
             "byokConnection": {
-              "id": "omniroute-local",
+              "id": "a1c7f3e2-9b4d-4e8a-b6f1-2d5c8e0a3b47",
               "revision": 1,
               "provider": "openai-compatible",
-              "model": "auto/best-coding"
+              "model": "auto"
             }
           }
           EOF
@@ -690,6 +689,23 @@ jobs:
           echo "OMNIROUTE_API_KEY=$OMNIROUTE_API_KEY" >> "$GITHUB_ENV"
 
       # ---------------------------------------------------------------- Hermes
+      - name: Verify OmniRoute is responding
+        run: |
+          echo "Verifying OmniRoute endpoint at http://127.0.0.1:${OMNIROUTE_PORT}/v1 ..."
+          healthy=0
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${OMNIROUTE_PORT}/api/monitoring/health" >/dev/null 2>&1; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$healthy" != 1 ]; then
+            echo "::error::OmniRoute is not responding at http://127.0.0.1:${OMNIROUTE_PORT}/v1 after 60s"
+            exit 1
+          fi
+          echo "OmniRoute is responding"
+
       - name: Install Hermes Agent
         continue-on-error: true
         run: |
@@ -706,10 +722,10 @@ jobs:
           rm -f "$RESTORE_ZIP"
 
       - name: Configure Hermes
-        continue-on-error: true
         run: |
           mkdir -p "$HOME/.hermes"
           touch "$HOME/.hermes/.env"
+
           upsert() {
             if grep -q "^$1=" "$HOME/.hermes/.env"; then
               sed -i "s|^$1=.*|$1=$2|" "$HOME/.hermes/.env"
@@ -717,17 +733,17 @@ jobs:
               printf '%s=%s\n' "$1" "$2" >> "$HOME/.hermes/.env"
             fi
           }
-          if [ -n "$OMNIROUTE_API_KEY" ]; then
-            upsert NVIDIA_BASE_URL   "http://127.0.0.1:${OMNIROUTE_PORT}/v1"
-            upsert NVIDIA_API_KEY    "$OMNIROUTE_API_KEY"
-            ~/.local/bin/hermes config set model.provider nvidia
-            ~/.local/bin/hermes config set model.default  "$OMNIROUTE_MODEL"
-          elif [ -n "$NVIDIA_API_KEY" ]; then
-            upsert NVIDIA_API_KEY    "$NVIDIA_API_KEY"
-            upsert NVIDIA_BASE_URL   "$NVIDIA_BASE_URL"
-            ~/.local/bin/hermes config set model.provider nvidia
-            ~/.local/bin/hermes config set model.default  "$HERMES_MODEL"
-          fi
+
+          # Always use OmniRoute (OpenAI-compatible / custom provider) with auto model.
+          # No NVIDIA fallback — OmniRoute is the only provider from here on.
+          upsert OMNIROUTE_BASE_URL   "http://127.0.0.1:${OMNIROUTE_PORT}/v1"
+          upsert OMNIROUTE_API_KEY    "$OMNIROUTE_API_KEY"
+
+          ~/.local/bin/hermes config set model.provider custom
+          ~/.local/bin/hermes config set model.base_url "http://127.0.0.1:${OMNIROUTE_PORT}/v1"
+          ~/.local/bin/hermes config set model.api_key "$OMNIROUTE_API_KEY"
+          ~/.local/bin/hermes config set model.default "auto"
+
           if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
             upsert TELEGRAM_BOT_TOKEN     "$TELEGRAM_BOT_TOKEN"
             upsert TELEGRAM_ALLOWED_USERS "$TELEGRAM_USER_ID"
