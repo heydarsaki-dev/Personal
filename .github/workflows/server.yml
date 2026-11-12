@@ -839,7 +839,7 @@ jobs:
               "revision": 1,
               "name": "omniroute-local",
               "provider": "openai-compatible",
-              "model": "auto",
+              "model": "MyCombo",
               "baseUrl": "http://127.0.0.1:${OMNIROUTE_PORT}/v1",
               "contextWindow": 128000,
               "maxOutputTokens": 32000,
@@ -858,7 +858,7 @@ jobs:
               "id": "a1c7f3e2-9b4d-4e8a-b6f1-2d5c8e0a3b47",
               "revision": 1,
               "provider": "openai-compatible",
-              "model": "auto"
+              "model": "MyCombo"
             }
           }
           EOF
@@ -913,7 +913,7 @@ jobs:
             fi
           }
 
-          # Always use OmniRoute (OpenAI-compatible / custom provider) with auto model.
+          # Always use OmniRoute (OpenAI-compatible / custom provider) with MyCombo model.
           # No NVIDIA fallback — OmniRoute is the only provider from here on.
           upsert OMNIROUTE_BASE_URL   "http://127.0.0.1:${OMNIROUTE_PORT}/v1"
           upsert OMNIROUTE_API_KEY    "$OMNIROUTE_API_KEY"
@@ -921,7 +921,7 @@ jobs:
           ~/.local/bin/hermes config set model.provider custom
           ~/.local/bin/hermes config set model.base_url "http://127.0.0.1:${OMNIROUTE_PORT}/v1"
           ~/.local/bin/hermes config set model.api_key "$OMNIROUTE_API_KEY"
-          ~/.local/bin/hermes config set model.default "auto"
+          ~/.local/bin/hermes config set model.default "MyCombo"
 
           # ---- SearXNG as the web_search backend -------------------------------
           # The endpoint is not a secret, but SEARXNG_URL is read from the env
