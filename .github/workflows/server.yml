@@ -20,7 +20,7 @@ on:
 
 concurrency:
   group: server
-  cancel-in-progress: true      # newest run wins, no overlapping nodes
+  cancel-in-progress: false     # never cancel a running node: a cancelled job saves no cache
 
 permissions:
   contents: read
@@ -737,38 +737,38 @@ jobs:
             echo "::warning title=OmniRoute::password reset failed (no database yet?)"
           fi
 
-    #  - name: Patch OmniRoute for model footer
-    #    run: |
-    #      node -e '
-    #        const fs = require("fs");
-    #        const path = require("path");
-    #        const file = path.join(process.env.HOME, "omniroute-app/node_modules/omniroute/open-sse/handlers/chatCore/nonStreamingResponse.ts");
-    #       if (fs.existsSync(file)) {
-    #          let content = fs.readFileSync(file, "utf8");
-    #          const target = "if (echoModel) echoModelInObject(translatedResponse, echoModel);";
-    #          const addition = "\\n    if (responseModel && typeof translatedResponse === \\\"object\\\" && translatedResponse !== null) {\\n      (translatedResponse as Record<string, unknown>).served_model = responseModel;\\n    }";
-    #          if (!content.includes("served_model = responseModel")) {
-    #            content = content.replace(target, target + addition);
-    #            fs.writeFileSync(tsFile, content);
-    #            console.log("Patched nonStreamingResponse.ts (non-streaming footer)");
-    #          } else {
-    #            console.log("nonStreamingResponse.ts already patched");
-    #          }
-    #        }
-    #        const chunksDir = path.join(process.env.HOME, "omniroute-app/node_modules/omniroute/dist/.build/next/server/chunks");
-    #        if (fs.existsSync(chunksDir)) {
-    #          const fb = ["try{let _fm=\"[model: \"+ex+\"]\",_fc={id:\"chatcmpl-omniroute-footer\",","object:\"chat.completion.chunk\",created:Math.floor(Date.now()/1e3),","model:ex,choices:[{index:0,delta:{content:\"\\\\n\\\\n\"+_fm},finish_reason:null}]},","_fo=\"data: \"+JSON.stringify(_fc)+\"\\\\n\\\\n\";","eE?.appendConvertedChunk?.(_fo),eB(e,tN.encode(_fo)),tO.push(_fc)}catch{}"].join("");
-    #          const anchors = [
-    #            ["}if(await tG(e,eQ),tC=!0,ez){tO.push({done:!0});let t=\\\"data: [DONE]\\\\\\\\n\\\\\\\\n\\\";eE?.appendConvertedChunk?.(t),eB(e,tN.encode(t))}","}if(await tG(e,eQ),tC=!0,ez){"+fb+"tO.push({done:!0});let t=\\\"data: [DONE]\\\\\\\\n\\\\\\\\n\\\";eE?.appendConvertedChunk?.(t),eB(e,tN.encode(t))}"],
-    #            ["}if(await tB(e,eK),tC=!0,eV){tO.push({done:!0});let t=\\\"data: [DONE]\\\\\\\\n\\\\\\\\n\\\";eE?.appendConvertedChunk?.(t),eB(e,tN.encode(t))}","}if(await tB(e,eK),tC=!0,eV){"+fb+"tO.push({done:!0});let t=\\\"data: [DONE]\\\\\\\\n\\\\\\\\n\\\";eE?.appendConvertedChunk?.(t),eB(e,tN.encode(t))}"]
-    #          ];
-    #          let count=0;
-    #          for (const fname of fs.readdirSync(chunksDir)) {
-    #            const fpath=path.join(chunksDir,fname);
-    #            try { if (!fs.statSync(fpath).isFile()) continue; let d=fs.readFileSync(fpath,"utf8"); if (d.includes("chatcmpl-omniroute-footer")) continue; let patched=false; for (const [o,n] of anchors) { if (d.includes(o)) { d=d.replace(o,n); patched=true; break; } } if (patched) { fs.writeFileSync(fpath,d); count++; console.log("Patched chunk:",fname); } } catch{} }
-    #          console.log("Patched "+count+" streaming chunks");
-    #        }
-    #      '
+      - name: Patch OmniRoute for model footer
+        run: |
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const file = path.join(process.env.HOME, "omniroute-app/node_modules/omniroute/open-sse/handlers/chatCore/nonStreamingResponse.ts");
+           if (fs.existsSync(file)) {
+              let content = fs.readFileSync(file, "utf8");
+              const target = "if (echoModel) echoModelInObject(translatedResponse, echoModel);";
+              const addition = "\\n    if (responseModel && typeof translatedResponse === \\\"object\\\" && translatedResponse !== null) {\\n      (translatedResponse as Record<string, unknown>).served_model = responseModel;\\n    }";
+              if (!content.includes("served_model = responseModel")) {
+                content = content.replace(target, target + addition);
+                fs.writeFileSync(file, content);
+                console.log("Patched nonStreamingResponse.ts (non-streaming footer)");
+              } else {
+                console.log("nonStreamingResponse.ts already patched");
+              }
+            }
+            const chunksDir = path.join(process.env.HOME, "omniroute-app/node_modules/omniroute/dist/.build/next/server/chunks");
+            if (fs.existsSync(chunksDir)) {
+              const fb = ["try{let _fm=\"[model: \"+ex+\"]\",_fc={id:\"chatcmpl-omniroute-footer\",","object:\"chat.completion.chunk\",created:Math.floor(Date.now()/1e3),","model:ex,choices:[{index:0,delta:{content:\"\\\\n\\\\n\"+_fm},finish_reason:null}]},","_fo=\"data: \"+JSON.stringify(_fc)+\"\\\\n\\\\n\";","eE?.appendConvertedChunk?.(_fo),eB(e,tN.encode(_fo)),tO.push(_fc)}catch{}"].join("");
+              const anchors = [
+                ["}if(await tG(e,eQ),tC=!0,ez){tO.push({done:!0});let t=\\\"data: [DONE]\\\\\\\\n\\\\\\\\n\\\";eE?.appendConvertedChunk?.(t),eB(e,tN.encode(t))}","}if(await tG(e,eQ),tC=!0,ez){"+fb+"tO.push({done:!0});let t=\\\"data: [DONE]\\\\\\\\n\\\\\\\\n\\\";eE?.appendConvertedChunk?.(t),eB(e,tN.encode(t))}"],
+                ["}if(await tB(e,eK),tC=!0,eV){tO.push({done:!0});let t=\\\"data: [DONE]\\\\\\\\n\\\\\\\\n\\\";eE?.appendConvertedChunk?.(t),eB(e,tN.encode(t))}","}if(await tB(e,eK),tC=!0,eV){"+fb+"tO.push({done:!0});let t=\\\"data: [DONE]\\\\\\\\n\\\\\\\\n\\\";eE?.appendConvertedChunk?.(t),eB(e,tN.encode(t))}"]
+              ];
+              let count=0;
+              for (const fname of fs.readdirSync(chunksDir)) {
+                const fpath=path.join(chunksDir,fname);
+                try { if (!fs.statSync(fpath).isFile()) continue; let d=fs.readFileSync(fpath,"utf8"); if (d.includes("chatcmpl-omniroute-footer")) continue; let patched=false; for (const [o,n] of anchors) { if (d.includes(o)) { d=d.replace(o,n); patched=true; break; } } if (patched) { fs.writeFileSync(fpath,d); count++; console.log("Patched chunk:",fname); } } catch{} }
+              console.log("Patched "+count+" streaming chunks");
+            }
+          '
 
       - name: Start OmniRoute
         continue-on-error: true
