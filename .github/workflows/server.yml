@@ -746,7 +746,7 @@ jobs:
            if (fs.existsSync(file)) {
               let content = fs.readFileSync(file, "utf8");
               const target = "if (echoModel) echoModelInObject(translatedResponse, echoModel);";
-              const addition = "\\n    if (responseModel && typeof translatedResponse === \\\"object\\\" && translatedResponse !== null) {\\n      (translatedResponse as Record<string, unknown>).served_model = responseModel;\\n    }";
+              const addition = "\n    if (responseModel && typeof translatedResponse === \"object\" && translatedResponse !== null) {\n      (translatedResponse as Record<string, unknown>).served_model = responseModel;\n    }";
               if (!content.includes("served_model = responseModel")) {
                 content = content.replace(target, target + addition);
                 fs.writeFileSync(file, content);
