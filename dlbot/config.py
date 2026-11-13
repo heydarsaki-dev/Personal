@@ -76,6 +76,18 @@ class Config:
     def max_file_bytes(self) -> int:
         return self.max_file_mb * 1024 * 1024
 
+    def ytdlp_argv(self) -> list[str]:
+        """yt-dlp lives at an absolute path on the runner; fall back to PATH / module."""
+        import shutil
+        import sys as _sys
+
+        if self.ytdlp.exists():
+            return [str(self.ytdlp)]
+        found = shutil.which("yt-dlp")
+        if found:
+            return [found]
+        return [_sys.executable, "-m", "yt_dlp"]
+
 
 def _env_path(env: Mapping[str, str], key: str, default: Path) -> Path:
     raw = env.get(key)

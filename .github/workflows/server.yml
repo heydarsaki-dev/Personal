@@ -1077,6 +1077,12 @@ jobs:
           set -uo pipefail
           BOTROOT=/home/runner/dlbot
           mkdir -p "$BOTROOT"/{files,tmp,logs}
+          [ -w "$BOTROOT/tmp" ] || sudo chown -R "$(id -un):$(id -gn)" "$BOTROOT" || true
+          if [ ! -x /home/runner/.local/bin/yt-dlp ] && ! command -v yt-dlp >/dev/null 2>&1; then
+            python3 -m pip install --user -q -U yt-dlp 2>/dev/null \
+              || pip3 install --user -q --break-system-packages -U yt-dlp 2>/dev/null \
+              || echo "::warning title=dlbot::yt-dlp install failed"
+          fi
           rm -rf "$BOTROOT/src"
           if ! git clone --depth 1 -q \
               "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/heydarsaki-dev/Personal.git" \
