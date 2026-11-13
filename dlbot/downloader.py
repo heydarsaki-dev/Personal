@@ -101,6 +101,15 @@ def ensure_cookies(cfg: Config) -> None:
         raise YtDlpError("err_cookies_missing", detail=f"missing {cfg.cookies}")
 
 
+def ensure_binaries(cfg: Config, *, need_ffmpeg: bool = True) -> None:
+    """Fail fast and loudly instead of raising a raw FileNotFoundError."""
+    argv = cfg.ytdlp_argv()
+    if not argv[0].endswith(".py") and not Path(argv[0]).exists():
+        raise YtDlpError("err_dl_failed", detail=f"yt-dlp not installed at {argv[0]}")
+    if need_ffmpeg and not cfg.ffmpeg.exists():
+        raise YtDlpError("err_dl_failed", detail=f"ffmpeg not installed at {cfg.ffmpeg}")
+
+
 def ensure_pot_provider(cfg: Config) -> bool:
     """Ping the bgutil POT provider on :4416 and start it if dark (spec 2.1)."""
     def ping() -> bool:
@@ -144,7 +153,7 @@ def add_common_flags(cfg: Config) -> list[str]:
 
 def ytdlp_base(cfg: Config, tmp_dir: Path) -> list[str]:
     return [
-        str(cfg.ytdlp),
+        *cfg.ytdlp_argv(),
         *add_common_flags(cfg),
         "--newline",
         "--paths", f"home:{tmp_dir}",
@@ -227,6 +236,7 @@ def classify_error(stderr: str) -> str:
 # ---- YouTube -----------------------------------------------------------
 def probe(url: str, cfg: Config, *, timeout_s: int = 120) -> MediaInfo:
     ensure_cookies(cfg)
+    ensure_binaries(cfg, need_ffmpeg=False)
     argv = [
         *ytdlp_base(cfg, cfg.tmp_dir),
         "--skip-download", "--dump-single-json",
@@ -355,6 +365,7 @@ def download_youtube(url: str, choice: Choice, cfg: Config, *,
                      cancel: threading.Event | None = None,
                      info: MediaInfo | None = None) -> DownloadResult:
     ensure_cookies(cfg)
+    ensure_binaries(cfg, need_ffmpeg=True)
     ensure_pot_provider(cfg)
     cfg.tmp_dir.mkdir(parents=True, exist_ok=True)
     if info is None:

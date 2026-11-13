@@ -125,7 +125,7 @@ class Bot:
         try:
             import subprocess
 
-            out = subprocess.run([str(self.cfg.ytdlp), "--version"], capture_output=True,
+            out = subprocess.run([*self.cfg.ytdlp_argv(), "--version"], capture_output=True,
                                  text=True, timeout=30)
             return (out.stdout or "").strip() or "?"
         except Exception:
