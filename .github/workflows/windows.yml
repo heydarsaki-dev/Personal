@@ -1,4 +1,4 @@
-name: Windows 
+name: Windows Server
 
 on:
   workflow_dispatch:
@@ -8,12 +8,11 @@ on:
         required: false
         default: "350"
   schedule:
-    # Every 6h: the job budget below is 335 min, so the next scheduled run
-    # (360 min later) cannot cancel this one through the concurrency group.
-    - cron: "0 */6 * * *"      # fresh node every 6h, replaces the dying one
+    - cron: "0 */6 * * *"
+
 concurrency:
-  group: Windows 
-  cancel-in-progress: false     # never cancel a running node: a cancelled job saves no cache
+  group: Windows
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -21,160 +20,359 @@ permissions:
 jobs:
   Windows:
     runs-on: windows-2022
-    timeout-minutes: 350
+    timeout-minutes: 355
     env:
       TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
       TS_TAILNET: ${{ secrets.TS_TAILNET || '-' }}
       TS_CLIENT_ID: ${{ secrets.TS_CLIENT_ID }}
       TS_CLIENT_SECRET: ${{ secrets.TS_CLIENT_SECRET }}
-      
+      RUN_MINUTES: ${{ inputs.run_minutes || '350' }}
+      NODE_NAME: gh-win-vpn
+      EXIT_TAG: tag:gh-exit
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+      HERMES_BACKUP_TOKEN: ${{ secrets.HERMES_BACKUP_TOKEN }}
+      HERMES_BACKUP_REPO: heydarsaki-dev/HermesBackup
+      HERMES_MODEL: MyCombo
+      NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
+      HERMES_RESTART_DELAY: 10
+      OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
+      OMNIROUTE_MODEL: ${{ vars.OMNIROUTE_MODEL || 'MyCombo' }}
+      OMNIROUTE_VERSION: "3.8.53"
+      OMNIROUTE_PORT: "20128"
+      V2RAY_DOMAIN: ${{ vars.V2RAY_DOMAIN || 'vpn.heydarsaki.bond' }}
+      V2RAY_UUID: ${{ secrets.V2RAY_UUID || '' }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN || '' }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID || '' }}
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || '' }}
+      CF_TUNNEL_ID: ${{ secrets.CF_TUNNEL_ID || '' }}
+      V2RAY_PORT: "8080"
+      V2RAY_WS_PATH: "/v2ray"
+      SEARXNG_REPO: https://github.com/searxng/searxng.git
+      SEARXNG_ROOT: $env:USERPROFILE\.searxng
+      SEARXNG_PORT: "8888"
+      SEARXNG_URL: http://127.0.0.1:8888
+      JOB_TIMEOUT_MINUTES: "335"
+      DLBOT_ROOT: $env:USERPROFILE\dlbot
+      HERMES_HOME: $env:USERPROFILE\.hermes
     steps:
-      - name: Configure Core RDP Settings
-        run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-         
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Fixed Password
-        run: |
-          $password = "${{ secrets.RDP_PASSWORD }}"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          }
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-         
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-         
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
-      - name: Delete old tailnet nodes
-        continue-on-error: true
+      - name: Record job start
         shell: pwsh
         run: |
-          $tokenResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/oauth/token" `
-            -Method Post `
-            -Body @{
-              client_id     = $env:TS_CLIENT_ID
-              client_secret = $env:TS_CLIENT_SECRET
-              grant_type    = "client_credentials"
-            }
-          
-          $headers = @{
-            Authorization = "Bearer $($tokenResponse.access_token)"
-          }
+          "JOB_START_EPOCH=$(Get-Date -UFormat %s)" >> $env:GITHUB_ENV
+          Write-Host "Job started at $(Get-Date -Format o) UTC"
 
-          $devicesResponse = Invoke-RestMethod -Uri "https://tailscale.com" `
-            -Method Get `
-            -Headers $headers
+      - name: Delete old tailnet nodes
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $tokenResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/oauth/token" -Method Post -Body @{ client_id = $env:TS_CLIENT_ID; client_secret = $env:TS_CLIENT_SECRET; grant_type = "client_credentials" }
+          $headers = @{ Authorization = "Bearer $($tokenResponse.access_token)" }
+          $devices = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$env:TS_TAILNET/devices" -Headers $headers
+          $stale = $devices.devices | Where-Object { $_.hostname -eq $env:NODE_NAME }
+          foreach ($d in $stale) { Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$env:TS_TAILNET/devices/$($d.id)" -Method Delete -Headers $headers; Write-Host "removed $($d.id)" }
 
-          $staleDevices = $devicesResponse.devices | Where-Object { $_.hostname -eq $env:NODE_NAME }
-
-          foreach ($device in $staleDevices) {
-            Invoke-RestMethod -Uri "https://tailscale.com" `
-              -Method Delete `
-              -Headers $headers
-            Write-Output "removed stale node $($device.id)"
-          }
       - name: Install Tailscale
+        shell: pwsh
+        continue-on-error: true
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.104.7-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-         
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.104.7-amd64.msi" -OutFile "$env:TEMP\tailscale.msi"
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\tailscale.msi`"", "/quiet", "/norestart" -Wait
 
-      - name: Establish Tailscale Connection
+      - name: Join tailnet as exit node
+        shell: pwsh
+        continue-on-error: true
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TS_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-         
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-         
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-     
-      - name: Verify RDP Accessibility
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          for ($i = 1; $i -le 30; $i++) { if (& $ts status 2>$null) { break }; Start-Sleep -Seconds 1 }
+          & $ts up --authkey=$env:TS_AUTHKEY --hostname=$env:NODE_NAME --advertise-exit-node --advertise-tags=$env:EXIT_TAG --accept-dns=false --ssh --timeout=60s
+          Start-Sleep -Seconds 3
+          $ip = & $ts ip -4
+          "NODE_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Get public IP
+        shell: pwsh
+        id: public-ip
+        continue-on-error: true
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-         
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          try { $pub = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10 } catch { $pub = "unknown" }
+          "PUBLIC_IP=$pub" >> $env:GITHUB_ENV
 
-      - name: Maintain Connection + Watch RDP User
+      - name: Install v2ray
+        shell: pwsh
+        if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
+        continue-on-error: true
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          Invoke-WebRequest -Uri "https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-windows-64.zip" -OutFile "$env:TEMP\v2ray.zip"
+          Expand-Archive -Path "$env:TEMP\v2ray.zip" -DestinationPath "$env:USERPROFILE\v2ray" -Force
 
-          $rdpProfile = "C:\Users\RDP"
-          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
-          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
-          $downloadPath = "$startupPath\Downloads.bat"
+      - name: Generate v2ray config
+        shell: pwsh
+        if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
+        continue-on-error: true
+        run: |
+          $uuid = $env:UUID.Trim().ToLower()
+          if ($uuid -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { Write-Error "bad UUID"; exit 1 }
+          $cfg = @{ inbounds = @( @{ port = [int]$env:PORT; listen = "127.0.0.1"; protocol = "vmess"; settings = @{ clients = @( @{ id = $uuid; alterId = 0 } ) }; streamSettings = @{ network = "ws"; wsSettings = @{ path = $env:WS_PATH; headers = @{ Host = $env:DOMAIN } } } } ); outbounds = @( @{ protocol = "freedom"; settings = @{} } ); dns = @{ servers = @( "https+local://1.1.1.1/dns-query", "8.8.8.8", "localhost" ) } } | ConvertTo-Json -Depth 10
+          New-Item -ItemType Directory -Path "$env:USERPROFILE\v2ray" -Force | Out-Null
+          Set-Content -Path "$env:USERPROFILE\v2ray\config.json" -Value $cfg
+          & "$env:USERPROFILE\v2ray\v2ray.exe" test -config "$env:USERPROFILE\v2ray\config.json"
 
-          while ($true) {
-              if (Test-Path $rdpProfile) {
-                  try {
-                      if (-not (Test-Path $startupPath)) {
-                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
-                      }
+      - name: Start v2ray
+        shell: pwsh
+        if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
+        continue-on-error: true
+        run: |
+          Start-Process "$env:USERPROFILE\v2ray\v2ray.exe" -ArgumentList "run -config `"$env:USERPROFILE\v2ray\config.json`"" -RedirectStandardOutput "$env:USERPROFILE\v2ray.log" -RedirectStandardError "$env:USERPROFILE\v2ray.log" -WindowStyle Hidden
+          Start-Sleep -Seconds 5
+          for ($i = 1; $i -le 20; $i++) { if (Test-NetConnection -ComputerName 127.0.0.1 -Port $env:V2RAY_PORT -InformationLevel Quiet) { break }; Start-Sleep -Seconds 1 }
 
-                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
-                      Write-Host "? Downloads.bat copied to $downloadPath"
+      - name: Start Cloudflare Tunnel
+        shell: pwsh
+        if: env.V2RAY_DOMAIN != '' && env.CF_TUNNEL_ID != '' && env.CF_ACCOUNT_ID != '' && env.CF_API_TOKEN != ''
+        continue-on-error: true
+        run: |
+          $token = $env:CF_API_TOKEN.Trim().Trim('"').Trim("'")
+          if ([string]::IsNullOrEmpty($token) -or [string]::IsNullOrEmpty($env:ACCOUNT_ID) -or [string]::IsNullOrEmpty($env:TUNNEL_ID)) { Write-Warning "tunnel skipped"; exit 0 }
+          if (-not (Test-Path "$env:USERPROFILE\cloudflared.exe")) { Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "$env:USERPROFILE\cloudflared.exe" }
+          $tokBody = Invoke-RestMethod -Uri "https://api.cloudflare.com/client/v4/accounts/$env:ACCOUNT_ID/cfd_tunnel/$env:TUNNEL_ID/token" -Headers @{ "Authorization" = "Bearer $token" }
+          $tunnelTok = $tokBody.result
+          Set-Content -Path "$env:USERPROFILE\.cloudflared-tunnel-token" -Value $tunnelTok
+          $ing = @{ config = @{ ingress = @( @{ hostname = $env:DOMAIN; path = $env:WS_PATH; service = "http://localhost:$env:PORT" }, @{ service = "http_status:404" } ); warp-routing = @{ enabled = $false } } } | ConvertTo-Json -Depth 10
+          Invoke-RestMethod -Uri "https://api.cloudflare.com/client/v4/accounts/$env:ACCOUNT_ID/cfd_tunnel/$env:TUNNEL_ID/configurations" -Method PUT -Headers @{ "Authorization" = "Bearer $token"; "Content-Type" = "application/json" } -Body $ing | Out-Null
+          Start-Process "$env:USERPROFILE\cloudflared.exe" -ArgumentList "tunnel", "run", "--token", $tunnelTok -RedirectStandardOutput "$env:USERPROFILE\cloudflared.log" -RedirectStandardError "$env:USERPROFILE\cloudflared.log" -WindowStyle Hidden
+          $conn = $false
+          for ($i = 1; $i -le 60; $i++) { if (Select-String -Path "$env:USERPROFILE\cloudflared.log" -Pattern "Registered tunnel connection" -Quiet) { $conn = $true; break }; Start-Sleep -Seconds 2 }
 
-                      # Run the batch file for the first time
-                      cmd /c $downloadPath
-                      Write-Host "? Downloads.bat executed successfully"
-                      break
-                  }
-                  catch {
-                      Write-Host "? Error copying or executing Downloads.bat: $($_.Exception.Message)"
-                      break
-                  }
-              }
-              else {
-                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
-                  Start-Sleep -Seconds 30
-              }
+      - name: Cache SearXNG
+        shell: pwsh
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: ~/.searxng
+          key: searxng-${{ runner.os }}-py312-v1
+
+      - name: Install SearXNG
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ROOT = $env:SEARXNG_ROOT
+          New-Item -ItemType Directory -Path $ROOT -Force | Out-Null
+          if (Test-Path "$ROOT\venv\Scripts\python.exe") { Write-Host "cached" } else {
+            Remove-Item -Recurse -Force "$ROOT\venv", "$ROOT\src" -ErrorAction SilentlyContinue
+            git clone --depth 1 -q $env:SEARXNG_REPO "$ROOT\src"
+            python3 -m venv "$ROOT\venv"
+            & "$ROOT\venv\Scripts\python.exe" -m pip install -U pip wheel
+            & "$ROOT\venv\Scripts\python.exe" -m pip install -r "$ROOT\src\requirements.txt"
           }
 
-          # Keep runner alive
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+      - name: Generate SearXNG settings
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ROOT = $env:SEARXNG_ROOT
+          if (Test-Path "$ROOT\settings.yml") { exit 0 }
+          $sec = [System.Web.Security.Membership]::GeneratePassword(64, 0)
+          $s = "use_default_settings: true`ngeneral:`n  instance_name: `"Hermes SearXgn`"`nsearch:`n  formats:`n    - html`n    - json`n  safe_search: 0`nserver:`n  bind_address: `"127.0.0.1`"`n  port: $env:SEARXNG_PORT`n  secret_key: `"$sec`"`n"
+          Set-Content -Path "$ROOT\settings.yml" -Value $s
+
+      - name: Start SearXNG
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ROOT = $env:SEARXNG_ROOT
+          Start-Process powershell.exe -ArgumentList "-NoExit", "-Command", "`$env:SEARXNG_SETTINGS_PATH=`"$ROOT\settings.yml`"; Set-Location `"$ROOT\src`"; & `"$ROOT\venv\Scripts\python.exe`" -m searx.webapp >> `"$env:USERPROFILE\searxng.log`" 2>&1`"" -WindowStyle Hidden
+          $ready = $false
+          for ($i = 1; $i -le 60; $i++) { if (Invoke-RestMethod -Uri "$env:SEARXNG_URL/search?q=ok&format=json" -TimeoutSec 5 -ErrorAction SilentlyContinue) { $ready = $true; break }; Start-Sleep -Seconds 1 }
+
+      - name: Restore state from backup
+        shell: pwsh
+        id: restore
+        continue-on-error: true
+        run: |
+          if ([string]::IsNullOrEmpty($env:HERMES_BACKUP_TOKEN)) { exit 0 }
+          $work = [System.IO.Path]::GetTempFileName(); Remove-Item $work; New-Item -ItemType Directory -Path $work -Force | Out-Null
+          git clone --quiet --depth 1 "https://x-access-token:***" $work 2>$null | Out-Null
+          if (Test-Path "$work\hermes-state.zip") { Copy-Item "$work\hermes-state.zip" "$env:USERPROFILE\hermes-restore.zip"; "RESTORE_ZIP=$env:USERPROFILE\hermes-restore.zip" >> $env:GITHUB_ENV }
+          if (Test-Path "$work\omniroute-state.zip") { Expand-Archive -Path "$work\omniroute-state.zip" -DestinationPath $env:USERPROFILE -Force }
+          Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+
+      - name: Cache Hermes runtime
+        shell: pwsh
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.hermes/tools
+            ~/.hermes/cache/uv
+            ~/.hermes/installs
+          key: hermes-${{ runner.os }}-tools-v1
+
+      - name: Set up Node.js
+        shell: pwsh
+        uses: actions/setup-node@v4
+        continue-on-error: true
+        with:
+          node-version: "24"
+
+      - name: Cache npm
+        shell: pwsh
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-node24-${{ env.OMNIROUTE_VERSION }}
+
+      - name: Cache OmniRoute
+        shell: pwsh
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: ~/omniroute-app
+          key: omniroute-${{ runner.os }}-node24-${{ env.OMNIROUTE_VERSION }}
+
+      - name: Install OmniRoute
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $bin = "$env:USERPROFILE\omniroute-app\node_modules\.bin\omniroute.cmd"
+          if (-not (Test-Path $bin)) { npm install --prefix "$env:USERPROFILE\omniroute-app" --no-audit --no-fund "omniroute@$env:OMNIROUTE_VERSION" }
+          & $bin --version || true
+
+      - name: Patch OmniRoute footer
+        shell: pwsh
+        run: |
+          $file = Join-Path $env:USERPROFILE "omniroute-app/node_modules/omniroute/open-sse/handlers/chatCore/nonStreamingResponse.ts"
+          if (Test-Path $file) {
+            $c = Get-Content -Path $file -Raw
+            $t = "if (echoModel) echoModelInObject(translatedResponse, echoModel);"
+            $a = "`n    if (responseModel && typeof translatedResponse === `"`"object`"`" && translatedResponse !== null) {`n      (translatedResponse as Record<string, unknown>).served_model = responseModel;`n    }"
+            if (-not $c.Contains("served_model = responseModel")) { Set-Content -Path $file -Value ($c.Replace($t, $t + $a)); Write-Host "patched" }
           }
+
+      - name: Start OmniRoute
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Path "$env:USERPROFILE\.omniroute" -Force | Out-Null
+          $env:DATA_DIR = "$env:USERPROFILE\.omniroute"
+          $env:PORT = $env:OMNIROUTE_PORT
+          Start-Process powershell.exe -ArgumentList "-NoExit", "-Command", "& `"$env:USERPROFILE\omniroute-app\node_modules\.bin\omniroute.cmd`" serve --no-open >> `"$env:USERPROFILE\omniroute.log`" 2>&1`"" -WindowStyle Hidden
+          $h = $false
+          for ($i = 1; $i -le 90; $i++) { if (Invoke-RestMethod -Uri "http://127.0.0.1:$env:OMNIROUTE_PORT/api/monitoring/health" -TimeoutSec 5 -ErrorAction SilentlyContinue) { $h = $true; break }; Start-Sleep -Seconds 2 }
+
+      - name: Install Hermes Agent
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Invoke-WebRequest -Uri "https://hermes-agent.nousresearch.com/install.sh" -OutFile "$env:TEMP\hermes-install.sh"
+          bash "$env:TEMP\hermes-install.sh" --non-interactive --skip-browser --skip-computer-use
+          "$env:USERPROFILE\.local\bin" >> $env:GITHUB_PATH
+          & "$env:USERPROFILE\.local\bin\hermes" --version
+
+      - name: Import Hermes state
+        shell: pwsh
+        if: env.RESTORE_ZIP != ''
+        continue-on-error: true
+        run: |
+          & "$env:USERPROFILE\.local\bin\hermes" import "$env:RESTORE_ZIP" --force
+
+      - name: Configure Hermes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "$env:HERMES_HOME" -Force | Out-Null
+          & "$env:USERPROFILE\.local\bin\hermes" config set model.provider custom
+          & "$env:USERPROFILE\.local\bin\hermes" config set model.base_url "http://127.0.0.1:$env:OMNIROUTE_PORT/v1"
+          & "$env:USERPROFILE\.local\bin\hermes" config set model.api_key "$env:OMNIROUTE_API_KEY"
+          & "$env:USERPROFILE\.local\bin\hermes" config set model.default "MyCombo"
+          & "$env:USERPROFILE\.local\bin\hermes" config set web.backend searxng
+
+      - name: Start Hermes gateway
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Start-Process "$env:USERPROFILE\.local\bin\hermes" -ArgumentList "gateway", "run", "--replace" -RedirectStandardOutput "$env:USERPROFILE\.hermes\logs\gateway.log" -RedirectStandardError "$env:USERPROFILE\.hermes\logs\gateway.err" -WindowStyle Hidden
+
+      - name: Start local Telegram Bot API server
+        shell: pwsh
+        if: always()
+        continue-on-error: true
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID || '147006' }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH || '' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_DL_BOT_TOKEN }}
+        run: |
+          $botRoot = "$env:DLBOT_ROOT"
+          New-Item -ItemType Directory -Path "$botRoot\files", "$botRoot\tmp", "$botRoot\logs" -Force | Out-Null
+          if ([string]::IsNullOrEmpty($env:TELEGRAM_API_HASH)) { Write-Warning "no API hash"; exit 0 }
+          Start-Process "$env:USERPROFILE\.hermes\tools\telegram-bot-api\bin\telegram-bot-api.exe" -ArgumentList "--api-id=`"$env:TELEGRAM_API_ID`"", "--api-hash=`"$env:TELEGRAM_API_HASH`"", "--local", "--http-address=127.0.0.1", "--http-port=8081", "--dir=`"$botRoot\tgbotapi`"", "--temp-dir=`"$botRoot\tmp`"" -RedirectStandardOutput "$botRoot\logs\botapi.log" -WindowStyle Hidden
+          for ($i = 1; $i -le 20; $i++) { try { Invoke-RestMethod -Uri "http://127.0.0.1:8081/bot$env:TELEGRAM_BOT_TOKEN/getMe" -TimeoutSec 3 -ErrorAction Stop; break } catch { Start-Sleep -Seconds 3 } }
+
+      - name: Start Telegram download bot
+        shell: pwsh
+        if: always()
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_DL_BOT_TOKEN }}
+          DLBOT_ADMIN_ID: "180329538"
+        run: |
+          $botRoot = "$env:DLBOT_ROOT"
+          New-Item -ItemType Directory -Path "$botRoot\files", "$botRoot\tmp", "$botRoot\logs" -Force | Out-Null
+          if (-not (Get-Command yt-dlp -ErrorAction SilentlyContinue)) { python3 -m pip install --user -q -U yt-dlp 2>$null | Out-Null }
+          Remove-Item -Recurse -Force "$botRoot\src" -ErrorAction SilentlyContinue
+          git clone --depth 1 -q "https://x-access-token:***" "$botRoot\src" 2>$null | Out-Null
+          if (Test-Path "$botRoot\src\dlbot") { Copy-Item "$botRoot\src\dlbot\*.py" -Destination "$botRoot\" -Force }
+          if (-not (Test-Path "$botRoot\bot.py")) { Write-Warning "no bot.py"; exit 0 }
+          Start-Process python3.exe -ArgumentList "-u", "$botRoot\bot.py" -RedirectStandardOutput "$botRoot\logs\bot.log" -RedirectStandardError "$botRoot\logs\bot.log" -WindowStyle Hidden
+          Start-Sleep -Seconds 8
+
+      - name: Keep alive
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $now = (Get-Date).ToUniversalTime(); $start = [datetime]::Parse($env:JOB_START_EPOCH)
+          $elapsed = ($now - $start).TotalSeconds; $budget = [int]$env:JOB_TIMEOUT_MINUTES * 60
+          $remain = $budget - $elapsed; $req = [int]$env:RUN_MINUTES * 60 - 300
+          $wait = if ($req -lt $remain) { $req } else { $remain }
+          if ($wait -lt 60) { exit 0 }
+          $end = [datetime]::Now.AddSeconds($wait)
+          while ([datetime]::Now -lt $end) { Start-Sleep -Seconds 60 }
+
+      - name: Stop all
+        shell: pwsh
+        if: always()
+        continue-on-error: true
+        run: |
+          Get-Process hermes -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-Process omniroute -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like "*bot.py*" } | Stop-Process -Force
+          Get-Process telegram-bot-api -ErrorAction SilentlyContinue | Stop-Process -Force
+          Remove-Item -Recurse -Force "$env:DLBOT_ROOT\files", "$env:DLBOT_ROOT\tmp", "$env:DLBOT_ROOT\src" -ErrorAction SilentlyContinue
+
+      - name: Back up state to GitHub
+        shell: pwsh
+        if: always()
+        continue-on-error: true
+        run: |
+          if ([string]::IsNullOrEmpty($env:HERMES_BACKUP_TOKEN)) { exit 0 }
+          $stamp = Get-Date -UFormat %Y%m%dT%H%M%SZ
+          $out = Join-Path $env:RUNNER_TEMP "state-out"
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          & "$env:USERPROFILE\.local\bin\hermes" backup -o "$out\hermes-state.zip" 2>$null | Out-Null
+          $work = Join-Path $env:RUNNER_TEMP "state-push"
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          git clone --quiet "https://x-access-token:***" $work 2>$null | Out-Null
+          Copy-Item "$out\*.zip" $work -Force
+          Set-Location $work
+          git add -f ./*.zip
+          git -c user.name=github-actions -c user.email=github-actions@github.com commit -q -m "state $stamp" || true
+          git branch -M main
+          git push -q --force origin main
+
+      - name: Leave tailnet
+        shell: pwsh
+        if: always()
+        continue-on-error: true
+        run: tailscale logout || true
