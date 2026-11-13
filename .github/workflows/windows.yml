@@ -1,35 +1,13 @@
-name: windows 
+name: Windows 
 
 on:
   workflow_dispatch:
-    inputs:
-      run_minutes:
-        description: "Minutes to keep the server alive (max 350)"
-        required: false
-        default: "350"
-  schedule:
-    # Every 6h: the job budget below is 335 min, so the next scheduled run
-    # (360 min later) cannot cancel this one through the concurrency group.
-    - cron: "0 */6 * * *"      # fresh node every 6h, replaces the dying one
-
-# Tailnet policy required for auto-approved exit nodes (Access controls / policy.json):
-#   "tagOwners":      { "tag:gh-exit": ["autogroup:admin"] },
-#   "autoApprovers":  { "exitNode": ["tag:gh-exit"] },
-# The auth key must also be created with the tag:gh-exit tag selected
-# (plus Reusable + Ephemeral), otherwise tailscale up rejects the tag request.
-
-concurrency:
-  group: windows
-  cancel-in-progress: false     # never cancel a running node: a cancelled job saves no cache
-
-permissions:
-  contents: read
 
 jobs:
-  windows:
+  Windows:
     runs-on: windows-2022
-    timeout-minutes: 355
-    
+    timeout-minutes: 350
+
     steps:
       - name: Configure Core RDP Settings
         run: |
@@ -53,7 +31,7 @@ jobs:
 
       - name: Create RDP User with Fixed Password
         run: |
-          $password = ${{ secrets.RDP_PASSWORD || 'rdp' }}
+          $password = "MR.English2008"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
@@ -80,13 +58,13 @@ jobs:
       - name: Establish Tailscale Connection
         run: |
           # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscalup --authkey=${{ secrets.TS_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TS_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
          
           # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:Progres\Tailscale\tailscale.exe" ip -4
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               Start-Sleep -Seconds 5
               $retries++
           }
@@ -113,11 +91,11 @@ jobs:
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: admin"
+          Write-Host "Username: RDP"
           Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
 
-          $rdpProfile = "C:\Users\admin"
+          $rdpProfile = "C:\Users\RDP"
           $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
           $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
           $downloadPath = "$startupPath\Downloads.bat"
