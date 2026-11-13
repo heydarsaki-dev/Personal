@@ -65,53 +65,14 @@ jobs:
               Write-Error "User creation failed"
               exit 1
           }
-      - name: Delete old tailnet nodes
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $token = (curl.exe -fsSL -d "client_id=$env:TS_CLIENT_ID" `
-            -d "client_secret=$env:TS_CLIENT_SECRET" `
-            -d "grant_type=client_credentials" `
-            https://api.tailscale.com/api/v2/oauth/token | ConvertFrom-Json).access_token
-
-          curl.exe -fsSL -H "Authorization: Bearer $token" `
-            "https://api.tailscale.com/api/v2/tailnet/$env:TS_TAILNET/devices" `
-            | ConvertFrom-Json | Select-Object -ExpandProperty devices `
-            | Where-Object { $_.hostname -eq $env:NODE_NAME } `
-            | ForEach-Object {
-                curl.exe -fsSL -X DELETE -H "Authorization: Bearer $token" `
-                  "https://api.tailscale.com/api/v2/device/$($_.id)"
-                Write-Output "removed stale node $($_.id)"
-              } 
-      - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-         
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale Connection
-        run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up  --authkey="$TS_AUTHKEY" --hostname="$NODE_NAME" --advertise-exit-node --advertise-tags="$EXIT_TAG" --accept-dns=false --timeout=60s
-         
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-         
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-     
+      - name: Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_AUTHKEY  }}
+          oauth-secret: ${{ secrets.TS_CLIENT_SECRET  }}
+          tags: tag:gh-exit
+          version: latest
+          
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
