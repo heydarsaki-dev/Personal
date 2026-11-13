@@ -71,6 +71,7 @@ jobs:
           oauth-client-id: ${{ secrets.TS_AUTHKEY  }}
           oauth-secret: ${{ secrets.TS_CLIENT_SECRET  }}
           tags: tag:gh-exit
+          log-mode: normal
           version: latest
           
       - name: Verify RDP Accessibility
