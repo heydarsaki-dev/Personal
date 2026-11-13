@@ -67,21 +67,32 @@ jobs:
           }
       - name: Delete old tailnet nodes
         continue-on-error: true
+        shell: pwsh
         run: |
-          token=$(curl -fsSL -d "client_id=$TS_CLIENT_ID" 
-                          -d "client_secret=$TS_CLIENT_SECRET" 
-                          -d "grant_type=client_credentials" 
-                          https://api.tailscale.com/api/v2/oauth/token 
-                  | jq -r '.access_token')
-          curl -fsSL -H "Authorization: Bearer $token" 
-            "https://api.tailscale.com/api/v2/tailnet/$TS_TAILNET/devices" 
-            | jq -r --arg name "$NODE_NAME" '.devices[]? | select(.hostname == $name) | .id' 
-            | while read -r id; do
-                curl -fsSL -X DELETE -H "Authorization: Bearer $token" 
-                  "https://api.tailscale.com/api/v2/device/$id"
-                echo "removed stale node $id"
-              done
-    
+          $tokenResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/oauth/token" `
+            -Method Post `
+            -Body @{
+              client_id     = $env:TS_CLIENT_ID
+              client_secret = $env:TS_CLIENT_SECRET
+              grant_type    = "client_credentials"
+            }
+          
+          $headers = @{
+            Authorization = "Bearer $($tokenResponse.access_token)"
+          }
+
+          $devicesResponse = Invoke-RestMethod -Uri "https://tailscale.com" `
+            -Method Get `
+            -Headers $headers
+
+          $staleDevices = $devicesResponse.devices | Where-Object { $_.hostname -eq $env:NODE_NAME }
+
+          foreach ($device in $staleDevices) {
+            Invoke-RestMethod -Uri "https://tailscale.com" `
+              -Method Delete `
+              -Headers $headers
+            Write-Output "removed stale node $($device.id)"
+          }
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.104.7-amd64.msi"
