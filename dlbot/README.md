@@ -22,9 +22,27 @@ HELP/status strings rendered in HTML (bold only).
 Steps 1–3 are `continue-on-error: true`: they can never take down v2ray,
 OmniRoute or the Hermes gateway.
 
-Required repo secret: `TELEGRAM_API_HASH` (api_id 147006 is hard-coded, the hash
-is not). Without it step 1 skips itself and the bot falls back to the public Bot
-API (50 MB cap).
+Required repo secrets (already stored): `TELEGRAM_DL_BOT_TOKEN` (the downloader
+bot — the job-level `TELEGRAM_BOT_TOKEN` is the Hermes gateway bot and must not
+be used here), `TELEGRAM_API_HASH`, `TELEGRAM_API_ID`. Without the API hash step 1
+skips itself and the bot falls back to the public Bot API (50 MB cap).
+
+## Verified live (2026-11-13, this node)
+
+| check | result |
+|---|---|
+| local Bot API server, `/getMe` on 127.0.0.1:8081 | ok → @heydar_downloader_bot |
+| direct link → document in chat | delivered (msg 16, 6034 B), sha256 recorded |
+| YouTube picker → video mp4 | delivered (msg 36, 629 172 B, api file_size match) |
+| YouTube picker → mp3 128 kbps | delivered (msg 18, 305 153 B), ffprobe `128000 bps` |
+| 256 MB mp4 through the local server | delivered (msg 38, 268 514 852 B) — >50 MB cap gone |
+| failure matrix | Instagram / not-a-url / SSRF / bad scheme / over-cap / cookies-missing all Persian, bot alive |
+| expiry button after deleting the file | «منقضی شده» reply |
+| /help, /status (lifetime line), /cancel, /kill | ok; /kill refused for a non-admin, stops the bot for the admin |
+
+Not verified live: the format picker's video-quality submenu (480/720), the
+queue under real load, and a real runner restart mid-download. Drivers for the
+live runs live in `dlbot/tests/`.
 
 ## Layout
 

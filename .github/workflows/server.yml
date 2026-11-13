@@ -1017,8 +1017,11 @@ jobs:
         if: always()
         continue-on-error: true
         env:
-          TELEGRAM_API_ID: "147006"
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID || '147006' }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH || '' }}
+          # the downloader bot, NOT the Hermes gateway bot that the job-level
+          # TELEGRAM_BOT_TOKEN belongs to
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_DL_BOT_TOKEN }}
         run: |
           set -uo pipefail
           BOTROOT=/home/runner/dlbot
@@ -1071,6 +1074,7 @@ jobs:
         if: always()
         continue-on-error: true
         env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_DL_BOT_TOKEN }}
           TELEGRAM_BOT_API_ROOT: http://127.0.0.1:8081
           DLBOT_ADMIN_ID: "180329538"
         run: |
