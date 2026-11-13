@@ -2,15 +2,19 @@ name: Windows
 
 # Windows node on a GitHub-hosted runner (the Linux counterpart is server.yml).
 #
-# Current scope: M2 - node skeleton correctness only. Deliberately NOT implemented
-# yet (blocked on the CEO decisions in windows-port-plan.md section 9):
-# Hermes Agent, OmniRoute, SearXNG, v2ray, cloudflared, Freebuff.
+# Current scope: M2 - node skeleton correctness only. The CEO decisions Q1-Q8 are
+# closed (windows-port-plan.md), but the stack itself is still NOT implemented here:
+# Hermes Agent, OmniRoute and SearXNG land in M3/M4/M5 and wait for that contract.
+# Never part of this workflow (Q1): v2ray, cloudflared, Freebuff.
+# Never part of this workflow (Q3): Telegram - the Windows gateway is platform-less.
 #
-# Two rules this file must keep:
+# Three rules this file must keep:
 #   * one stable tailnet identity (NODE_NAME=gh-win) so the stale-node cleanup can
 #     find the previous incarnation of this node;
 #   * the job always ends on its own (bounded keep-alive) so the always() teardown
-#     steps run - a job killed by timeout-minutes saves nothing.
+#     steps run - a job killed by timeout-minutes saves nothing;
+#   * state goes into the ONE shared file set of Q4 (hermes-state.zip +
+#     omniroute-state.zip at the repo root, members per OS) - no windows-*.zip names.
 
 on:
   workflow_dispatch:
@@ -240,7 +244,7 @@ jobs:
             "| RDP | ``$ip`:3389`` - user ``RDP``, password = repo secret ``RDP_PASSWORD`` |"
             "| Job budget | $($env:JOB_TIMEOUT_MINUTES) min (bounded keep-alive) |"
             ""
-            "> Hermes / OmniRoute / SearXNG / v2ray / cloudflared are not part of this workflow yet (M2)."
+            "> Hermes / OmniRoute / SearXNG are not part of this workflow yet (M2). v2ray, cloudflared and Freebuff are excluded by design (Q1); no Telegram on this node (Q3)."
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
           Write-Host "job summary published: $dns ($ip)"
@@ -379,16 +383,23 @@ jobs:
           Write-Host "tailscale services stopped"
 
       # ---- PLACEHOLDER: real backup lands in M3+ (needs the CEO backup contract) ----
-      # Target file names, mirroring the Linux names in server.yml:
-      #   windows-hermes-state.zip     <- hermes backup -o windows-hermes-state.zip
-      #   windows-omniroute-state.zip  <- zip of %USERPROFILE%\.omniroute (OmniRoute DATA_DIR)
-      # Windows must push ONLY these two names, so the Linux zips in HermesBackup
-      # stay untouched. Nothing is produced or uploaded yet.
+      # Q4: ONE shared file set - the same two root files Linux writes and reads:
+      #   hermes-state.zip     container, per-OS members inside
+      #   omniroute-state.zip  container, per-OS members inside
+      # Windows writes ONLY its own member and never touches the other OS's member:
+      #   windows/hermes-windows.zip   real `hermes backup -o` archive (M3)
+      #   windows/omniroute-data.zip   zip of %USERPROFILE%\.omniroute, the OmniRoute
+      #                                DATA_DIR (M4)
+      # Restore (Q6: always restore) extracts only windows/* from the shared file, so
+      # Linux state can never land in %LOCALAPPDATA%\hermes. A container without a
+      # windows member is never rewritten from the Linux member without a normal
+      # Windows snapshot. No windows-*.zip file names exist (superseded by Q4).
       - name: Back up state to GitHub
         if: always()
         continue-on-error: true
         shell: pwsh
         run: |
           Write-Host "backup placeholder (M2): no state captured yet"
-          Write-Host "  would write: windows-hermes-state.zip, windows-omniroute-state.zip"
-          Write-Host "  would push only those names to HermesBackup (Linux zips untouched)"
+          Write-Host "  shared containers (Q4): hermes-state.zip, omniroute-state.zip"
+          Write-Host "  windows members to fill in M3/M4: windows/hermes-windows.zip, windows/omniroute-data.zip"
+          Write-Host "  restore (Q6) will extract only windows/* from the shared containers"

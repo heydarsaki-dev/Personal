@@ -72,6 +72,11 @@ jobs:
       # workflow always finishes before timeout-minutes and still has time for
       # the stop/backup steps. A cancelled job saves no cache.
       JOB_TIMEOUT_MINUTES: "335"
+      # Q5c: the "Squash backup history" step collapses the HermesBackup history
+      # (an orphan commit carrying the SAME root snapshots, pushed with
+      # --force-with-lease) once the repo exceeds this size. Kept as one knob
+      # because the number is the plan's proposal (OQ5), not a hard rule.
+      SQUASH_MIN_REPO_MB: "400"
     steps:
       - name: Record job start
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
@@ -1246,7 +1251,11 @@ jobs:
           branch=${branch:-main}
           work="$RUNNER_TEMP/state-push"
           rm -rf "$work"
-          if ! git clone --quiet \
+          # Q5a: shallow clone. The pusher only needs the current tip: the snapshot
+          # is written read-modify-write on top of it and the push below is
+          # fast-forward only, so a full clone of a ~480 MB repo every 6h is pure
+          # cost (the same repo is already fetched shallow in the restore step).
+          if ! git clone --quiet --depth 1 \
               "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git" "$work" 2>/dev/null; then
             mkdir -p "$work"
             git -C "$work" init -q
@@ -1259,12 +1268,104 @@ jobs:
           git -c user.name=github-actions -c user.email=github-actions@github.com \
             commit -q -m "state ${stamp}" || { echo "no changes to commit"; exit 0; }
           git branch -M "$branch"
-          git push -q --force origin "$branch"
-          git ls-remote --heads origin | awk '{print $2}' | sed 's|refs/heads/||' \
-            | while read -r b; do
-                [ "$b" = "$branch" ] || git push -q origin --delete "$b" || true
-              done
-          echo "state (${stamp}) pushed to ${HERMES_BACKUP_REPO}"
+
+          # Q5b: fast-forward-only publish. The old code force-pushed the branch and
+          # then DELETED every other branch in the repo; both are gone. The Windows
+          # node (M2+) writes the same two files on the same 6h cadence, offset by 30
+          # minutes, so the realistic failure is a rejected fast-forward: converge by
+          # fetching the tip and replaying this snapshot on top of it instead of
+          # overwriting the other side. A binary conflict means both sides changed the
+          # same snapshot; the bytes created in this run are the newer ones, so after a
+          # hard reset onto the fetched tip our two files are re-applied (the other
+          # OS's member, if any, keeps the remote copy).
+          publish() {
+            if git fetch -q origin "$branch" 2>/dev/null; then
+              if ! git rebase -q FETCH_HEAD >/dev/null 2>&1; then
+                git rebase --abort >/dev/null 2>&1 || true
+                echo "::notice title=Backup::rebase conflict - replaying this snapshot on the fetched tip"
+                git reset -q --hard FETCH_HEAD || return 1
+                cp -f "$out"/*.zip ./
+                git add -f ./*.zip
+                git -c user.name=github-actions -c user.email=github-actions@github.com \
+                  commit -q -m "state ${stamp} (replayed on a concurrent snapshot)" || return 1
+              fi
+            else
+              echo "no '$branch' on the remote yet - publishing the first commit"
+            fi
+            git push -q origin "HEAD:refs/heads/$branch"
+          }
+
+          pushed=0
+          for attempt in 1 2 3; do
+            if publish; then pushed=1; break; fi
+            echo "::warning title=Backup::publish attempt ${attempt} failed - retrying on the fetched tip"
+            git fetch -q origin "$branch" >/dev/null 2>&1 || true
+            git reset -q --hard FETCH_HEAD >/dev/null 2>&1 || true
+            cp -f "$out"/*.zip ./
+            git add -f ./*.zip
+            git -c user.name=github-actions -c user.email=github-actions@github.com \
+              commit -q -m "state ${stamp} (retry ${attempt})" || true
+          done
+          if [ "$pushed" != 1 ]; then
+            echo "::warning title=Backup::could not publish after 3 attempts - ${HERMES_BACKUP_REPO} keeps its previous snapshot, this run's snapshot stays at $out"
+            exit 0
+          fi
+          echo "state (${stamp}) pushed to ${HERMES_BACKUP_REPO} (branch $branch, fast-forward only, no branch deletion)"
+
+      - name: Squash backup history (growth cap)
+        if: always()
+        continue-on-error: true
+        run: |
+          # Q5c: keep HermesBackup near one snapshot instead of growing by ~126 MB
+          # every 6h. This step only collapses HISTORY: an orphan commit carrying the
+          # SAME root files, pushed with --force-with-lease (an expected old tip), so
+          # it is rejected rather than discarding a snapshot that a Windows run
+          # published in the meantime. Blob contents do not change, so the push sends
+          # the new commit and trees, not the 126 MB again. GitHub reclaims the now
+          # unreachable objects on its own GC schedule, i.e. the repo size drops over
+          # the following cycles, not inside this run.
+          if [ -z "${HERMES_BACKUP_TOKEN:-}" ]; then
+            echo "HERMES_BACKUP_TOKEN not set - skipping history squash"
+            exit 0
+          fi
+          work="$RUNNER_TEMP/state-push"
+          if [ ! -d "$work/.git" ]; then
+            echo "no state-push clone from this run - skipping history squash"
+            exit 0
+          fi
+          cd "$work"
+          branch=$(git rev-parse --abbrev-ref HEAD)
+          tip=$(git rev-parse HEAD)
+          count=$(git rev-list --count HEAD)
+          if [ "$count" -le 1 ]; then
+            echo "history is already a single commit - nothing to squash"
+            exit 0
+          fi
+          size_kb=$(curl -fsSL -H "Authorization: Bearer ${HERMES_BACKUP_TOKEN}" \
+            "https://api.github.com/repos/${HERMES_BACKUP_REPO}" | jq -r '.size // 0')
+          min_kb=$(( SQUASH_MIN_REPO_MB * 1024 ))
+          if [ "${size_kb:-0}" -lt "$min_kb" ]; then
+            echo "repo is ${size_kb} KB, below SQUASH_MIN_REPO_MB=${SQUASH_MIN_REPO_MB} MB - no squash needed"
+            exit 0
+          fi
+          # Only the shared root snapshots may be carried over. If the branch tracks
+          # anything else, refuse: a squash must never drop a file it does not know.
+          unexpected=$(git ls-tree -r --name-only HEAD | grep -vE '^[^/]+\.zip$' || true)
+          if [ -n "$unexpected" ]; then
+            echo "::warning title=Squash::tracked paths outside the shared root zips - refusing to squash"
+            printf '%s\n' "$unexpected"
+            exit 0
+          fi
+          files=$(git ls-tree --name-only HEAD | tr '\n' ' ')
+          git checkout -q --orphan squash-tmp
+          git -c user.name=github-actions -c user.email=github-actions@github.com \
+            commit -q -m "squashed state $(date -u +%Y%m%dT%H%M%SZ) - kept: ${files}"
+          if git push -q --force-with-lease="refs/heads/$branch:$tip" \
+              origin "HEAD:refs/heads/$branch"; then
+            echo "history squashed: ${count} commit(s) in this shallow clone -> 1 on '$branch' (old tip $tip, new tip $(git rev-parse HEAD))"
+          else
+            echo "::warning title=Squash::lease rejected - a fresher snapshot landed, retrying next cycle"
+          fi
 
       - name: Prune superseded Hermes environments
         if: always()
