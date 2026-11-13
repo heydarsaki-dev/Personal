@@ -53,17 +53,17 @@ jobs:
 
       - name: Create RDP User with Fixed Password
         run: |
-          $password = ${{ secrets.RDP_PASSWORD || 'admin' }}
+          $password = ${{ secrets.RDP_PASSWORD || 'rdp' }}
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (-not (Get-LocalUser -Name "admin" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "admin" -Password $securePass -AccountNeverExpires
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           }
-          Add-LocalGroupMember -Group "Administrators" -Member "admin"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "admin"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
          
-          echo "RDP_CREDS=User: admin | Password: $password" >> $env:GITHUB_ENV
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
          
-          if (-not (Get-LocalUser -Name "admin")) {
+          if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
               exit 1
           }
@@ -80,7 +80,7 @@ jobs:
       - name: Establish Tailscale Connection
         run: |
           # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TS_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          & "$env:ProgramFiles\Tailscale\tailscalup --authkey=${{ secrets.TS_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
          
           # Wait for Tailscale to assign an IP
           $tsIP = $null
