@@ -65,7 +65,6 @@ jobs:
               Write-Error "User creation failed"
               exit 1
           }
-          steps:
       - name: Delete old tailnet nodes
         continue-on-error: true
         shell: pwsh
