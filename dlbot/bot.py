@@ -417,16 +417,21 @@ class Bot:
         if ttl < cfg.ttl_s:
             caption_lt += "\n" + strings.render("lifetime_clamped", mm=ttl // 60)
         title = result.info.title or Path(result.path).name
-        caption = strings.render(
-            "caption_file", title=title[:120], size=human_size(result.size),
-            duration=human_duration(result.info.duration_s or result.choice.mp3_kbps and None or 0),
-            quality=result.choice.quality_label, lt_short=caption_lt,
-        )
         kind = "document"
         if result.choice.kind == "video":
             kind = "video"
-        elif result.path.suffix.lower() in (".m4a", ".mp3", ".opus", ".ogg"):
+        elif result.choice.kind == "audio":
             kind = "audio"
+        if kind == "document":
+            quality = strings.render("quality_document")
+            duration_text = "—"
+        else:
+            quality = result.choice.quality_label
+            duration_text = human_duration(result.info.duration_s)
+        caption = strings.render(
+            "caption_file", title=title[:120], size=human_size(result.size),
+            duration=duration_text, quality=quality, lt_short=caption_lt,
+        )
         record = FileRecord(
             token=token, chat_id=chat_id, path=Path(result.path), size=result.size,
             sha256=result.sha256, created_at=time.time(),

@@ -50,7 +50,7 @@ class MediaInfo:
 
 @dataclass(frozen=True)
 class Choice:
-    kind: Literal["video", "audio"]
+    kind: Literal["video", "audio", "document"]
     height: int | None = None
     audio_format: Literal["m4a", "mp3"] = "m4a"
     mp3_kbps: int | None = None
@@ -59,6 +59,8 @@ class Choice:
     def quality_label(self) -> str:
         if self.kind == "video":
             return f"{self.height or 1080}p • mp4"
+        if self.kind == "document":
+            return "document"
         if self.audio_format == "mp3":
             return f"{self.mp3_kbps} kbps • mp3"
         return "m4a (اصل)"
@@ -462,9 +464,12 @@ def download_direct(url: str, cfg: Config, *,
     if size > cfg.max_file_bytes:
         cleanup(target)
         raise YtDlpError("err_too_big", detail=f"{size} bytes")
-    media = MediaInfo(video_id="", title=target.name, uploader=info.host, ext=ext)
+    from urllib.parse import urlsplit as _urlsplit
+
+    nice_name = Path(_urlsplit(url).path).name or target.name
+    media = MediaInfo(video_id="", title=nice_name, uploader=info.host, ext=ext)
     return DownloadResult(
-        path=target, info=media, choice=Choice(kind="audio", audio_format="m4a"),
+        path=target, info=media, choice=Choice(kind="document"),
         sha256=sha256_file(target), size=size,
     )
 
