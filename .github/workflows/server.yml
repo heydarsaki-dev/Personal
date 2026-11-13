@@ -72,9 +72,27 @@ jobs:
       # workflow always finishes before timeout-minutes and still has time for
       # the stop/backup steps. A cancelled job saves no cache.
       JOB_TIMEOUT_MINUTES: "335"
+      # Q5c: the squash step collapses the HermesBackup history (orphan commit with
+      # the SAME two files, pushed with --force-with-lease) once the repo exceeds
+      # this size. The plan proposes 400 MB (OQ5 still open), so it lives here as a
+      # single knob instead of a hard rule.
+      SQUASH_MIN_REPO_MB: "400"
     steps:
       - name: Record job start
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
+      # The shared backup-container contract lives in scripts/hermes-backup-container.sh
+      # (plan section 5). It has to be on the runner, and it must be the SAME file the
+      # Windows job uses as its twin reads, so the repo is checked out into a
+      # subdirectory of the workspace. persist-credentials is off on purpose: this is
+      # a public repo, and the workspace must never hold a credential that could leak
+      # into the HermesBackup clone the backup step performs.
+      - name: Check out the contract scripts
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          path: repo
+          persist-credentials: false
 
       - name: Enable IP forwarding
         continue-on-error: true
@@ -645,12 +663,24 @@ jobs:
           fi
 
       # ---------------------------------------------------------------- Restore
+      # Shared container contract (plan section 5): hermes-state.zip and
+      # omniroute-state.zip are containers with one member per OS. This node reads
+      # ONLY linux/*, so the windows member can never be mixed into Linux state.
+      # A pre-M1 standalone hermes-state.zip (a bare `hermes backup -o` archive) is
+      # still a valid *inner* archive and is imported as-is once; the next backup
+      # migrates it into the container layout.
       - name: Restore state from backup
         id: restore
         continue-on-error: true
         run: |
-          if [ -z "$HERMES_BACKUP_TOKEN" ]; then
+          set -u
+          ctr="$GITHUB_WORKSPACE/repo/scripts/hermes-backup-container.sh"
+          if [ -z "${HERMES_BACKUP_TOKEN:-}" ]; then
             echo "HERMES_BACKUP_TOKEN not set - starting from scratch"
+            exit 0
+          fi
+          if [ ! -f "$ctr" ]; then
+            echo "::warning title=Restore::container helper $ctr missing (checkout failed) - starting from scratch"
             exit 0
           fi
           work="$(mktemp -d)"
@@ -660,14 +690,57 @@ jobs:
             rm -rf "$work"
             exit 0
           fi
-          if [ -f "$work/hermes-state.zip" ]; then
-            cp "$work/hermes-state.zip" "$HOME/hermes-restore.zip"
-            echo "RESTORE_ZIP=$HOME/hermes-restore.zip" >> "$GITHUB_ENV"
-          fi
-          if [ -f "$work/omniroute-state.zip" ]; then
-            unzip -oq "$work/omniroute-state.zip" -d "$HOME"
-            chmod 600 "$HOME/.omniroute/.env" 2>/dev/null || true
-          fi
+
+          # --- hermes-state.zip -> linux/hermes-linux.zip -> ~/hermes-restore.zip
+          # The extracted member is what `hermes import` receives, so it has to be a
+          # real `hermes backup -o` archive, never the container itself.
+          rm -f "$HOME/hermes-restore.zip"
+          rc=0
+          bash "$ctr" get --container "$work/hermes-state.zip" \
+            --member linux/hermes-linux.zip --out "$HOME/hermes-restore.zip" || rc=$?
+          case "$rc" in
+            0)
+              echo "hermes state restored from the linux member of hermes-state.zip"
+              echo "RESTORE_ZIP=$HOME/hermes-restore.zip" >> "$GITHUB_ENV" ;;
+            3)
+              echo "::warning title=Restore::no linux member in hermes-state.zip - fresh start" ;;
+            5)
+              if unzip -tq "$work/hermes-state.zip" >/dev/null 2>&1; then
+                cp "$work/hermes-state.zip" "$HOME/hermes-restore.zip"
+                echo "RESTORE_ZIP=$HOME/hermes-restore.zip" >> "$GITHUB_ENV"
+                echo "legacy standalone hermes-state.zip (pre-container) detected - imported as-is, the next backup migrates it"
+              else
+                echo "::warning title=Restore::hermes-state.zip is neither a container nor a readable archive - fresh start"
+              fi ;;
+            *)
+              echo "::warning title=Restore::hermes-state.zip unreadable (rc=$rc) - fresh start" ;;
+          esac
+
+          # --- omniroute-state.zip -> linux/omniroute-data.zip -> $HOME/.omniroute
+          rc=0
+          omni="$RUNNER_TEMP/omniroute-member.zip"
+          rm -f "$omni"
+          bash "$ctr" get --container "$work/omniroute-state.zip" \
+            --member linux/omniroute-data.zip --out "$omni" || rc=$?
+          case "$rc" in
+            0)
+              unzip -oq "$omni" -d "$HOME"
+              chmod 600 "$HOME/.omniroute/.env" 2>/dev/null || true
+              echo "omniroute state restored from the linux member of omniroute-state.zip" ;;
+            3)
+              echo "no linux member in omniroute-state.zip - fresh start" ;;
+            5)
+              if unzip -tq "$work/omniroute-state.zip" >/dev/null 2>&1; then
+                unzip -oq "$work/omniroute-state.zip" -d "$HOME"
+                chmod 600 "$HOME/.omniroute/.env" 2>/dev/null || true
+                echo "legacy standalone omniroute-state.zip (pre-container) detected - extracted as-is"
+              else
+                echo "::warning title=Restore::omniroute-state.zip is neither a container nor a readable archive"
+              fi ;;
+            *)
+              echo "::warning title=Restore::omniroute-state.zip unreadable (rc=$rc) - fresh start" ;;
+          esac
+          rm -f "$omni"
           rm -rf "$work"
 
       - name: Cache Hermes runtime
@@ -1208,31 +1281,44 @@ jobs:
           rm -rf "$BOTROOT/files" "$BOTROOT/tmp" "$BOTROOT/src"
           echo "bot + Bot API server stopped, temp files removed"
 
+      # ---------------------------------------------------------------- Backup
+      # Shared container contract (plan section 5): read the existing container from a
+      # fresh SHALLOW clone, replace ONLY linux/, leave the windows member's bytes
+      # untouched, rebuild, commit and push with fetch -> rebase -> push (never
+      # --force, never delete a branch). On a non-fast-forward the clone is thrown
+      # away and the merge is repeated once against the new remote state; if that
+      # fails too, nothing is pushed and the previous containers stay in place.
       - name: Back up state to GitHub
         if: always()
         continue-on-error: true
         run: |
-          if [ -z "$HERMES_BACKUP_TOKEN" ]; then
+          set -u
+          ctr="$GITHUB_WORKSPACE/repo/scripts/hermes-backup-container.sh"
+          if [ -z "${HERMES_BACKUP_TOKEN:-}" ]; then
             echo "HERMES_BACKUP_TOKEN not set - skipping backup"
             exit 0
+          fi
+          if [ ! -f "$ctr" ]; then
+            echo "::error title=Backup::container helper $ctr missing (checkout failed) - nothing pushed, previous backup kept"
+            exit 1
           fi
           stamp=$(date -u +%Y%m%dT%H%M%SZ)
           out="$RUNNER_TEMP/state-out"
           rm -rf "$out"; mkdir -p "$out"
           ok=1
           if [ -x "$HOME/.local/bin/hermes" ]; then
-            if ! ~/.local/bin/hermes backup -o "$out/hermes-state.zip"; then
+            if ! ~/.local/bin/hermes backup -o "$out/hermes-linux.zip"; then
               echo "::warning title=Backup::hermes backup failed"
               ok=0
             fi
           fi
           if [ -x "$HOME/omniroute-app/node_modules/.bin/omniroute" ] && [ -d "$HOME/.omniroute" ]; then
-            if ! ( cd "$HOME" && zip -qr "$out/omniroute-state.zip" .omniroute -x '.omniroute/logs/*' ); then
+            if ! ( cd "$HOME" && zip -qr "$out/omniroute-data.zip" .omniroute -x '.omniroute/logs/*' ); then
               echo "::warning title=Backup::omniroute backup failed"
               ok=0
             fi
           fi
-          if [ ! -f "$out/hermes-state.zip" ] && [ ! -f "$out/omniroute-state.zip" ]; then
+          if [ ! -f "$out/hermes-linux.zip" ] && [ ! -f "$out/omniroute-data.zip" ]; then
             echo "no state captured - leaving existing backup untouched"
             exit 0
           fi
@@ -1240,31 +1326,171 @@ jobs:
             echo "::warning title=Backup::snapshot failed - keeping previous backup"
             exit 0
           fi
+
+          hermes_version=""
+          if [ -x "$HOME/.local/bin/hermes" ]; then
+            hermes_version=$(~/.local/bin/hermes --version 2>/dev/null | head -n1 || true)
+          fi
+
           branch=$(curl -fsSL -H "Authorization: Bearer ${HERMES_BACKUP_TOKEN}" \
             "https://api.github.com/repos/${HERMES_BACKUP_REPO}" \
             | jq -r '.default_branch // empty')
           branch=${branch:-main}
-          work="$RUNNER_TEMP/state-push"
+          remote="https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git"
+
+          # merge_one <clone> <container> <member> <snapshot>
+          # Read-modify-write of ONE member. The helper leaves the input file alone
+          # and writes to <container>.new, so any failure keeps the previous file.
+          merge_one() {
+            local clone="$1" file="$2" member="$3" snap="$4" rc=0
+            bash "$ctr" put \
+              --container "$clone/$file" \
+              --member "$member" \
+              --source "$snap" \
+              --out "$clone/$file.new" \
+              --hostname "$NODE_NAME" \
+              --created-at "$stamp" \
+              --hermes-version "$hermes_version" \
+              --allow-legacy-migrate || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "::warning title=Backup::${file} update failed (rc=$rc) - keeping the previous file"
+              return 1
+            fi
+            mv -f "$clone/$file.new" "$clone/$file"
+            return 0
+          }
+
+          # push_state <clone>: fetch -> rebase -> push, no force, no branch deletion.
+          push_state() {
+            local w="$1"
+            if ! git -C "$w" fetch -q origin "$branch"; then
+              if [ -n "$(git -C "$w" ls-remote --heads origin "refs/heads/$branch" 2>/dev/null)" ]; then
+                return 1
+              fi
+              # no such branch on the remote yet (empty repo): nothing to rebase onto
+              git -C "$w" push -q origin "HEAD:refs/heads/$branch"
+              return $?
+            fi
+            if git -C "$w" rev-parse -q --verify FETCH_HEAD >/dev/null 2>&1; then
+              if ! git -C "$w" rebase -q FETCH_HEAD; then
+                git -C "$w" rebase --abort >/dev/null 2>&1 || true
+                return 1
+              fi
+            fi
+            git -C "$w" push -q origin "HEAD:refs/heads/$branch"
+          }
+
+          attempts=2
+          attempt=1
+          pushed=0
+          while [ "$attempt" -le "$attempts" ]; do
+            work="$RUNNER_TEMP/state-push"
+            rm -rf "$work"
+            if ! git clone --quiet --depth 1 "$remote" "$work" 2>/dev/null; then
+              echo "backup repo not clonable - starting a fresh local repository (attempt $attempt)"
+              mkdir -p "$work"
+              git -C "$work" init -q
+              git -C "$work" remote add origin "$remote"
+            fi
+            merge_ok=1
+            if [ -f "$out/hermes-linux.zip" ]; then
+              merge_one "$work" hermes-state.zip linux/hermes-linux.zip "$out/hermes-linux.zip" || merge_ok=0
+            fi
+            if [ -f "$out/omniroute-data.zip" ]; then
+              merge_one "$work" omniroute-state.zip linux/omniroute-data.zip "$out/omniroute-data.zip" || merge_ok=0
+            fi
+            if [ "$merge_ok" != 1 ]; then
+              echo "::error title=Backup::container update failed - nothing pushed, previous containers kept"
+              exit 1
+            fi
+            for f in hermes-state.zip omniroute-state.zip; do
+              if [ -f "$work/$f" ]; then git -C "$work" add -f -- "$f"; fi
+            done
+            if ! git -C "$work" -c user.name=github-actions -c user.email=github-actions@github.com \
+                 commit -q -m "state ${stamp}"; then
+              echo "no changes to commit"
+              exit 0
+            fi
+            if push_state "$work"; then
+              pushed=1
+              break
+            fi
+            echo "push to ${branch} rejected (attempt ${attempt}/${attempts}) - re-cloning and re-merging the linux member"
+            attempt=$((attempt + 1))
+          done
+          if [ "$pushed" != 1 ]; then
+            echo "::error title=Backup::push to ${HERMES_BACKUP_REPO} failed after ${attempts} attempts - snapshot not published, previous containers kept (snapshot stays in ${out} on this runner)"
+            exit 1
+          fi
+          echo "state (${stamp}) pushed to ${HERMES_BACKUP_REPO} (branch ${branch})"
+
+      # ---------------------------------------------------------------- Retention
+      # Q5c / plan section 5 "Retention / growth". Every push stores a fresh copy of
+      # both containers in the history (~+one snapshot per cycle). The squash reads
+      # the CURRENT tree, rewrites the branch as a single orphan commit carrying the
+      # SAME two files, and pushes with --force-with-lease - which is rejected, not
+      # obeyed, if a newer push landed after this clone. It deletes nothing.
+      - name: Squash backup history
+        if: always()
+        continue-on-error: true
+        run: |
+          set -u
+          if [ -z "${HERMES_BACKUP_TOKEN:-}" ]; then
+            echo "HERMES_BACKUP_TOKEN not set - skipping squash"
+            exit 0
+          fi
+          threshold_mb=${SQUASH_MIN_REPO_MB:-400}
+          size_kb=$(curl -fsSL -H "Authorization: Bearer ${HERMES_BACKUP_TOKEN}" \
+            "https://api.github.com/repos/${HERMES_BACKUP_REPO}" | jq -r '.size // empty')
+          if [ -z "$size_kb" ]; then
+            echo "::warning title=Squash::could not read the repo size - skipping squash"
+            exit 0
+          fi
+          if [ "$size_kb" -lt $((threshold_mb * 1024)) ]; then
+            echo "repo size ${size_kb} KB is below ${threshold_mb} MB - squash not needed"
+            exit 0
+          fi
+          branch=$(curl -fsSL -H "Authorization: Bearer ${HERMES_BACKUP_TOKEN}" \
+            "https://api.github.com/repos/${HERMES_BACKUP_REPO}" \
+            | jq -r '.default_branch // empty')
+          branch=${branch:-main}
+          remote="https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git"
+          work="$RUNNER_TEMP/state-squash"
           rm -rf "$work"
-          if ! git clone --quiet \
-              "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git" "$work" 2>/dev/null; then
-            mkdir -p "$work"
-            git -C "$work" init -q
-            git -C "$work" remote add origin \
-              "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git"
+          if ! git clone --quiet --depth 1 "$remote" "$work" 2>/dev/null; then
+            echo "::warning title=Squash::backup repo not clonable - skipping squash"
+            exit 0
           fi
           cd "$work"
-          cp "$out"/*.zip ./
-          git add -f ./*.zip
-          git -c user.name=github-actions -c user.email=github-actions@github.com \
-            commit -q -m "state ${stamp}" || { echo "no changes to commit"; exit 0; }
-          git branch -M "$branch"
-          git push -q --force origin "$branch"
-          git ls-remote --heads origin | awk '{print $2}' | sed 's|refs/heads/||' \
-            | while read -r b; do
-                [ "$b" = "$branch" ] || git push -q origin --delete "$b" || true
-              done
-          echo "state (${stamp}) pushed to ${HERMES_BACKUP_REPO}"
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          ok=1
+          for f in hermes-state.zip omniroute-state.zip; do
+            if [ ! -f "$f" ]; then
+              echo "::warning title=Squash::${f} missing from the backup repo - skipping squash"
+              ok=0
+            fi
+          done
+          if [ "$ok" != 1 ]; then
+            exit 0
+          fi
+          tree_before=$(git rev-parse -q --verify "HEAD^{tree}" || true)
+          git checkout -q --orphan "squash-${stamp}"
+          git add -A -f -- .
+          if ! git -c user.name=github-actions -c user.email=github-actions@github.com \
+               commit -q -m "squash ${stamp}: single snapshot (hermes-state.zip + omniroute-state.zip)"; then
+            echo "::warning title=Squash::commit failed - history left as it is"
+            exit 0
+          fi
+          tree_after=$(git rev-parse -q --verify "HEAD^{tree}")
+          if [ -n "$tree_before" ] && [ "$tree_before" != "$tree_after" ]; then
+            echo "::error title=Squash::the orphan commit would change the tree (${tree_before} -> ${tree_after}) - nothing pushed"
+            exit 1
+          fi
+          if git push -q --force-with-lease origin "HEAD:refs/heads/${branch}"; then
+            echo "squashed ${HERMES_BACKUP_REPO}@${branch} to a single commit (tree ${tree_after}, repo was ${size_kb} KB)"
+          else
+            echo "::warning title=Squash::rejected by --force-with-lease (a newer push landed) - the next cycle retries"
+          fi
 
       - name: Prune superseded Hermes environments
         if: always()
