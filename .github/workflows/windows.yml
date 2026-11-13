@@ -65,31 +65,25 @@ jobs:
               Write-Error "User creation failed"
               exit 1
           }
+          steps:
       - name: Delete old tailnet nodes
         continue-on-error: true
+        shell: pwsh
         run: |
-          token=$(curl -fsSL -d "client_id=$TS_CLIENT_ID" 
-                          -d "client_secret=$TS_CLIENT_SECRET" 
-                          -d "grant_type=client_credentials" 
-                          https://api.tailscale.com/api/v2/oauth/token 
-                  | jq -r '.access_token')
-          curl -fsSL -H "Authorization: Bearer $token" 
-            "https://api.tailscale.com/api/v2/tailnet/$TS_TAILNET/devices" 
-            | jq -r --arg name "$NODE_NAME" '.devices[]? | select(.hostname == $name) | .id' 
-            | while read -r id; do
-                curl -fsSL -X DELETE -H "Authorization: Bearer $token" 
-                  "https://api.tailscale.com/api/v2/device/$id"
-                echo "removed stale node $id"
-              done    
-      - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-         
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $token = (curl.exe -fsSL -d "client_id=$env:TS_CLIENT_ID" `
+            -d "client_secret=$env:TS_CLIENT_SECRET" `
+            -d "grant_type=client_credentials" `
+            https://api.tailscale.com/api/v2/oauth/token | ConvertFrom-Json).access_token
 
+          curl.exe -fsSL -H "Authorization: Bearer $token" `
+            "https://api.tailscale.com/api/v2/tailnet/$env:TS_TAILNET/devices" `
+            | ConvertFrom-Json | Select-Object -ExpandProperty devices `
+            | Where-Object { $_.hostname -eq $env:NODE_NAME } `
+            | ForEach-Object {
+                curl.exe -fsSL -X DELETE -H "Authorization: Bearer $token" `
+                  "https://api.tailscale.com/api/v2/device/$($_.id)"
+                Write-Output "removed stale node $($_.id)"
+              }    
       - name: Establish Tailscale Connection
         run: |
           # Bring up Tailscale with the provided auth key and set a unique hostname
