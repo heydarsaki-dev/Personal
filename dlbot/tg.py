@@ -1,10 +1,16 @@
 """Telegram client over the LOCAL Bot API server (spec section 4.7).
 
-Plain stdlib HTTP: the local server accepts an absolute file path in the file
-field, so a 500 MB video is sent without a multipart copy.
+Plain stdlib HTTP.  When the Bot API server runs in ``--local`` mode on the same
+host as the bot (native Windows binary, or a Linux container with the bot root
+bind-mounted) it accepts an absolute path in the file field, so a 500 MB video
+is sent without a second copy.  If the server cannot see the path (dockerised
+server without a bind mount) we fall back to a *streamed* multipart upload that
+never holds the file in memory.
 """
 from __future__ import annotations
 
+import contextlib
+import http.client
 import json
 import mimetypes
 import os
@@ -14,9 +20,11 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, Iterator
 
 from config import Config
+
+IS_WINDOWS = os.name == "nt"
 
 
 class TelegramError(RuntimeError):
@@ -26,54 +34,108 @@ class TelegramError(RuntimeError):
         self.retry_after = retry_after
 
 
+def _is_loopback(root: str) -> bool:
+    host = urllib.parse.urlsplit(root).hostname or ""
+    return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+
 class TelegramClient:
     def __init__(self, cfg: Config, *, timeout: int = 70) -> None:
         self.cfg = cfg
         self.timeout = timeout
         self.base = f"{cfg.api_root}/bot{cfg.bot_token}"
+        split = urllib.parse.urlsplit(cfg.api_root)
+        self._host = split.hostname or "127.0.0.1"
+        self._port = split.port or (443 if split.scheme == "https" else 80)
+        self._secure = split.scheme == "https"
 
     # ---- low level -----------------------------------------------------
     def _endpoint(self, method: str) -> str:
         return f"{self.base}/{method}"
 
+    def _connection(self, timeout: int) -> http.client.HTTPConnection:
+        if self._secure:
+            return http.client.HTTPSConnection(self._host, self._port, timeout=timeout)
+        return http.client.HTTPConnection(self._host, self._port, timeout=timeout)
+
     def call(self, method: str, params: dict[str, Any] | None = None, *,
              timeout: int | None = None, files: dict[str, Any] | None = None) -> dict[str, Any]:
         params = dict(params or {})
         timeout = timeout or self.timeout
-        data = None
-        headers = {"Content-Type": "application/json"}
         if files:
-            boundary = uuid.uuid4().hex
-            body = _multipart(params, files, boundary)
-            headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
-            data = body
+            payload = self._post_multipart(method, params, files, timeout)
         else:
-            data = json.dumps(params).encode("utf-8")
-        request = urllib.request.Request(self._endpoint(method), data=data, headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raw = ""
+            request = urllib.request.Request(
+                self._endpoint(method), data=json.dumps(params).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
             try:
-                raw = exc.read().decode("utf-8", "replace")
-            except Exception:
-                pass
-            retry_after = 0
-            description = raw
-            try:
-                parsed = json.loads(raw)
-                description = parsed.get("description", raw)
-                retry_after = int((parsed.get("parameters") or {}).get("retry_after", 0))
-            except Exception:
-                pass
-            raise TelegramError(description or f"HTTP {exc.code}", code=exc.code,
-                                retry_after=retry_after) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise TelegramError(f"network: {exc}", code=0) from exc
+                with urllib.request.urlopen(request, timeout=timeout) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                payload = _error_payload(exc)
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+                raise TelegramError(f"network: {exc}", code=0) from exc
         if not payload.get("ok"):
             raise TelegramError(str(payload.get("description", "api error")),
-                                code=int(payload.get("error_code", 0)))
+                                code=int(payload.get("error_code", 0)),
+                                retry_after=int((payload.get("parameters") or {}).get("retry_after", 0)))
+        return payload
+
+    def _post_multipart(self, method: str, params: dict[str, Any],
+                        files: dict[str, Any], timeout: int) -> dict[str, Any]:
+        """Stream the file body with a known Content-Length (no RAM copy)."""
+        boundary = uuid.uuid4().hex
+        head = bytearray()
+        for key, value in params.items():
+            if value is None or isinstance(value, (dict, list)):
+                value = json.dumps(value)
+            if not isinstance(value, (str, int, float)):
+                continue
+            head += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n"
+                     f"{value}\r\n").encode("utf-8")
+        total_file = 0
+        for key, path in files.items():
+            path = Path(path)
+            if not path.exists():
+                raise TelegramError(f"file missing: {path}")
+            ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            head += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"; "
+                     f"filename=\"{path.name}\"\r\nContent-Type: {ctype}\r\n\r\n").encode("utf-8")
+            total_file += path.stat().st_size
+        tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        content_length = len(head) + total_file + len(tail)
+
+        conn = self._connection(timeout)
+        try:
+            conn.putrequest("POST", urllib.parse.urlsplit(self._endpoint(method)).path)
+            conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+            conn.putheader("Content-Length", str(content_length))
+            conn.endheaders()
+            conn.send(bytes(head))
+            for path in files.values():
+                with open(path, "rb") as handle:
+                    while True:
+                        block = handle.read(1 << 20)
+                        if not block:
+                            break
+                        conn.send(block)
+            conn.send(tail)
+            response = conn.getresponse()
+            raw = response.read()
+        except (OSError, http.client.HTTPException) as exc:
+            raise TelegramError(f"network: {exc}", code=0) from exc
+        finally:
+            with contextlib.suppress(Exception):
+                conn.close()
+        try:
+            payload = json.loads(raw.decode("utf-8", "replace"))
+        except json.JSONDecodeError as exc:
+            raise TelegramError(f"bad response: {raw[:200]!r}", code=response.status) from exc
+        if not payload.get("ok"):
+            raise TelegramError(str(payload.get("description", f"HTTP {response.status}")),
+                                code=int(payload.get("error_code", response.status)),
+                                retry_after=int((payload.get("parameters") or {}).get("retry_after", 0)))
         return payload
 
     def get_me(self) -> dict[str, Any]:
@@ -135,71 +197,69 @@ class TelegramClient:
         except TelegramError:
             return
 
-    # ---- sending files (requirement 2) ---------------------------------
+    # ---- sending files (requirement 3) ---------------------------------
     def send_file(self, chat_id: int, path: Path, *, kind: str, caption: str,
                   title: str = "", duration_s: int | None = None,
                   keyboard: Any = None, retries: int = 3,
                   progress_cb: Any = None) -> dict[str, Any]:
         """kind in {video, audio, document}.
 
-        Read the file on the HOST and POST the bytes as multipart. The local
-        Bot API server (dockerized, no host bind-mount) never sees host paths,
-        so sending bytes avoids both docker file-system isolation and a second
-        disk copy on the runner.
+        Tries, in order: ``file://<abs>`` local path, the bare absolute path,
+        then a streamed multipart upload.  Works for a native local Bot API
+        server on Windows (both path forms) and for a dockerised one on Linux.
         """
         path = Path(path)
         if not path.exists():
             raise TelegramError(f"file missing: {path}")
-        use_local_path = self.cfg.api_root.startswith("http://127.0.0.1")
         method = {"video": "sendVideo", "audio": "sendAudio", "document": "sendDocument"}[kind]
         field = {"video": "video", "audio": "audio", "document": "document"}[kind]
 
+        base_params: dict[str, Any] = {"chat_id": chat_id, "caption": caption,
+                                       "parse_mode": "HTML"}
+        if kind == "video":
+            base_params["supports_streaming"] = True
+        if title:
+            base_params["title"] = title[:128]
+            if kind == "document":
+                base_params["file_name"] = _file_name(path, title)
+        if duration_s and kind in ("audio", "video"):
+            base_params["duration"] = int(duration_s)
+        if keyboard is not None:
+            base_params["reply_markup"] = {"inline_keyboard": keyboard}
+
+        absolute = str(path.resolve())
+        attempts: list[tuple[str, dict[str, Any] | None]] = []
+        if _is_loopback(self.cfg.api_root):
+            attempts.append((f"file://{absolute}", None))
+            attempts.append((absolute, None))
+        attempts.append(("bytes", {field: path}))
+
         last_error: TelegramError | None = None
-        for attempt in range(1, retries + 1):
-            params: dict[str, Any] = {"chat_id": chat_id, "caption": caption,
-                                      "parse_mode": "HTML"}
-            if use_local_path:
-                params[field] = f"file://{str(path.resolve())}"
-            if kind == "video":
-                params["supports_streaming"] = True
-            if title:
-                params["title"] = title[:128]
-                if kind == "document":
-                    params["file_name"] = _file_name(path, title)
-            if duration_s and kind == "audio":
-                params["duration"] = int(duration_s)
-            if keyboard is not None:
-                params["reply_markup"] = {"inline_keyboard": keyboard}
-            try:
-                # Local server accepts an absolute path string in the file field;
-                # fall back to multipart bytes if that path isn't visible to it
-                # (e.g. dockerized server without a host bind-mount).
-                files: dict[str, Any] | None = None
-                if use_local_path:
-                    try:
-                        result = self.call(method, params, timeout=1800)["result"]
-                    except TelegramError as exc:
-                        if exc.code != 400:
-                            raise
-                        # Fallback: stream bytes from the host (e.g. dockerized
-                        # server without a host bind-mount can't see host paths).
-                        params.pop(field, None)
-                        files = {field: path}
-                        result = self.call(method, params, files=files, timeout=1800)["result"]
-                else:
-                    result = self.call(method, params, files={field: path}, timeout=1800)["result"]
-                if progress_cb:
-                    progress_cb(100)
-                return result
-            except TelegramError as exc:
-                last_error = exc
-                if exc.code in (429, 500, 502, 503, 504) or exc.code == 0:
-                    wait = min(exc.retry_after or (2 ** attempt), 30)
+        for attempt, (label, files) in enumerate(attempts, start=1):
+            params = dict(base_params)
+            if label != "bytes":
+                params[field] = label
+            for retry in range(1, retries + 1):
+                try:
+                    result = self.call(method, params, files=files, timeout=1800)["result"]
                     if progress_cb:
-                        progress_cb(attempt, {"retry": wait, "max": retries, "code": exc.code})
-                    time.sleep(wait)
-                    continue
-                raise
+                        progress_cb(100)
+                    return result
+                except TelegramError as exc:
+                    last_error = exc
+                    # A 400 on a local path means "the server cannot see this
+                    # path" -> try the next (cheaper -> more expensive) form.
+                    if label != "bytes" and exc.code == 400:
+                        break
+                    if exc.code in (429, 500, 502, 503, 504) or exc.code == 0:
+                        wait = min(exc.retry_after or (2 ** retry), 30)
+                        if progress_cb:
+                            progress_cb(attempt, {"retry": wait, "max": retries, "code": exc.code})
+                        time.sleep(wait)
+                        continue
+                    if label == "bytes":
+                        raise
+                    break
         raise last_error or TelegramError("upload failed")
 
     def send_video_path(self, chat_id: int, path: Path, **kw: Any) -> dict[str, Any]:
@@ -212,6 +272,16 @@ class TelegramClient:
         return self.send_file(chat_id, path, kind="audio", **kw)
 
 
+def _error_payload(exc: urllib.error.HTTPError) -> dict[str, Any]:
+    raw = ""
+    with contextlib.suppress(Exception):
+        raw = exc.read().decode("utf-8", "replace")
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"ok": False, "error_code": exc.code, "description": raw or f"HTTP {exc.code}"}
+
+
 def _file_name(path: Path, title: str) -> str:
     from re import sub
 
@@ -220,7 +290,7 @@ def _file_name(path: Path, title: str) -> str:
 
 
 def _multipart(params: dict[str, Any], files: dict[str, Any], boundary: str) -> bytes:
-    """Minimal multipart encoder — used only when the public API is in play."""
+    """Legacy in-memory multipart encoder (small payloads only)."""
     out = bytearray()
     for key, value in params.items():
         if value is None or not isinstance(value, (str, int, float)):

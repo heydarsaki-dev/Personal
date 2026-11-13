@@ -34,7 +34,7 @@ from registry import FileRecord, Registry, admin_alert, run_sweeper  # noqa: E40
 from tg import TelegramClient, TelegramError  # noqa: E402
 
 PROGRESS_MIN_INTERVAL = 4.0
-UPLOAD_LIMIT_MB = 2000
+PUBLIC_API_UPLOAD_LIMIT_MB = 50
 
 
 class Bot:
@@ -81,13 +81,34 @@ class Bot:
         chat_id = int(chat.get("id", 0))
         user_id = int((msg.get("from") or {}).get("id", chat_id))
         text = (msg.get("text") or msg.get("caption") or "").strip()
-        if not chat_id or not text:
+        if not chat_id:
             return
         if text.startswith("/"):
             self.on_command(chat_id, user_id, text)
             return
+        if not text:
+            # A bare reply/sticker pointing at an earlier file: the user is
+            # referencing the file we sent (requirement 3).
+            self.on_reference(chat_id, msg.get("reply_to_message") or {})
+            return
         info = classify(text)
         self.handle_url(chat_id, user_id, info)
+
+    # ---- referencing an already-sent file (requirement 3) ---------------
+    def on_reference(self, chat_id: int, replied: dict[str, Any]) -> None:
+        if not replied:
+            return
+        replied_id = int(replied.get("message_id", 0))
+        record = self.reg.find_by_message(chat_id, replied_id)
+        if record is not None and self.reg.is_alive(record.token):
+            self.resend_file(chat_id, record)
+            return
+        has_file = any(key in replied for key in ("document", "video", "audio", "animation"))
+        from_bot = bool((replied.get("from") or {}).get("is_bot"))
+        if has_file or record is not None or from_bot:
+            self.send_key(chat_id, "expired", lt=self.lt())
+            return
+        self.send_key(chat_id, "err_not_url")
 
     def on_command(self, chat_id: int, user_id: int, text: str) -> None:
         command = text.split()[0].split("@")[0].lower()
@@ -408,9 +429,10 @@ class Bot:
     def deliver(self, chat_id: int, result: DownloadResult, token: str,
                 host: str | None, *, progress_id: int | None = None) -> None:
         cfg = self.cfg
-        if result.size > UPLOAD_LIMIT_MB * 1024 * 1024:
+        limit_mb = cfg.tg_upload_limit_mb
+        if result.size > limit_mb * 1024 * 1024:
             self.send_key(chat_id, "err_tg_limit", size=human_size(result.size),
-                          limit=UPLOAD_LIMIT_MB)
+                          limit=limit_mb)
             return
         ttl = self.reg.ttl()
         caption_lt = strings.lifetime_line(cfg, short=True)
@@ -461,6 +483,19 @@ class Bot:
         print(f"[send] chat={chat_id} token={token} size={result.size} "
               f"sha256={result.sha256} path={result.path}", flush=True)
 
+    def resend_file(self, chat_id: int, record: FileRecord) -> None:
+        caption = strings.render(
+            "caption_file", title=record.title[:120], size=human_size(record.size),
+            duration=human_duration(record.duration_s), quality=record.quality,
+            lt_short=strings.lifetime_line(self.cfg, short=True),
+        )
+        try:
+            self.tg.send_file(chat_id, record.path, kind=record.kind, caption=caption,
+                              title=record.title, duration_s=record.duration_s,
+                              keyboard=strings.kb_resend(token=record.token))
+        except TelegramError as exc:
+            self.send_key(chat_id, "err_upload", reason=str(exc)[:150], code=exc.code)
+
     def handle_resend(self, cb_id: str, chat_id: int, token: str) -> None:
         record = self.reg.get(token)
         if record is None or not self.reg.is_alive(token):
@@ -472,17 +507,7 @@ class Bot:
                 pass
             return
         self.tg.answer_callback(cb_id, text=strings.render("resend_ok", lt_short=strings.lifetime_line(self.cfg, short=True)))
-        caption = strings.render(
-            "caption_file", title=record.title[:120], size=human_size(record.size),
-            duration=human_duration(record.duration_s), quality=record.quality,
-            lt_short=strings.lifetime_line(self.cfg, short=True),
-        )
-        try:
-            self.tg.send_file(chat_id, record.path, kind=record.kind, caption=caption,
-                              title=record.title, duration_s=record.duration_s,
-                              keyboard=strings.kb_resend(token=token))
-        except TelegramError as exc:
-            self.send_key(chat_id, "err_upload", reason=str(exc)[:150], code=exc.code)
+        self.resend_file(chat_id, record)
 
     # ---- run -----------------------------------------------------------
     def run(self) -> int:
@@ -507,7 +532,8 @@ class Bot:
                 # fall back to the public API: still works, but the upload cap drops to 50 MB
                 from dataclasses import replace
 
-                fallback = replace(cfg, api_root="https://api.telegram.org", tg_upload_limit_mb=50)
+                fallback = replace(cfg, api_root="https://api.telegram.org",
+                                   tg_upload_limit_mb=PUBLIC_API_UPLOAD_LIMIT_MB)
                 self.cfg = fallback
                 self.tg = TelegramClient(fallback)
                 poller.tg = self.tg

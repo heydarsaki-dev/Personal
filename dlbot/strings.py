@@ -183,6 +183,11 @@ MSG: dict[str, str] = {
         "\u274c خطای غیرمنتظره‌ای رخ داد.\n\n\U0001f194 کد خطا: <code>{code}</code>\n"
         "\U0001f4e8 خطا برای مدیر ثبت شد.\n\U0001f504 دوباره تلاش کن یا /cancel را بزن."
     ),
+    "err_bad_type": (
+        "\U0001f6ab <b>این نوع فایل پشتیبانی نمیشود</b>\n\n"
+        "فقط فایلهای معمول (سند، آرشیو، ویدیو، صدا، تصویر) پذیرفته میشوند.\n"
+        "\u2139\ufe0f راهنما: /help"
+    ),
     "err_stale_callback": "\u231b این پیام قدیمی شده است. لینک را دوباره بفرست.",
     "err_degraded_audio": (
         "\u26a0\ufe0f کیفیت ویدیویی این لینک قابل دانلود نبود؛ بهترین کیفیت صوتی فرستاده شد."
@@ -205,7 +210,7 @@ def cross_check() -> list[str]:
         "err_members", "err_age", "err_botcheck", "err_geo", "err_sabr", "err_no_formats",
         "err_cookies_missing", "err_dl_failed", "err_dl_timeout", "err_upload",
         "err_upload_retry", "err_botapi_down", "err_no_time", "err_rate_limit", "err_user_busy",
-        "err_queue_full", "err_disk_full", "err_internal", "err_stale_callback",
+        "err_queue_full", "err_disk_full", "err_internal", "err_stale_callback", "err_bad_type",
     ]
     return [key for key in required if key not in MSG]
 

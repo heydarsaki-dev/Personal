@@ -107,6 +107,17 @@ class Registry:
             row = conn.execute("SELECT * FROM files WHERE token=?", (token,)).fetchone()
         return FileRecord.from_row(row) if row else None
 
+    def find_by_message(self, chat_id: int, message_id: int) -> FileRecord | None:
+        """Used when a user replies to a file the bot sent (requirement 3)."""
+        if not message_id:
+            return None
+        with self._lock, contextlib.closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM files WHERE chat_id=? AND message_id=? ORDER BY created_at DESC LIMIT 1",
+                (chat_id, message_id),
+            ).fetchone()
+        return FileRecord.from_row(row) if row else None
+
     def mark_sent(self, token: str, chat_id: int, message_id: int) -> None:
         with self._lock, contextlib.closing(self._connect()) as conn:
             conn.execute(
