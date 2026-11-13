@@ -154,7 +154,9 @@ class TelegramClient:
                                       "parse_mode": "HTML"}
             files: dict[str, Any] | None = None
             if use_local_path:
-                params[field] = str(path)          # local Bot API server reads the file itself
+                # The local Bot API server needs a file:// URL and the file must live
+                # under a path that is bind-mounted into its container (verified).
+                params[field] = "file://" + str(path.resolve())
             else:
                 files = {field: path}              # public API: multipart upload
             if kind == "video":
