@@ -1008,6 +1008,101 @@ jobs:
             echo "> v2ray is reachable via Cloudflare Tunnel at $V2RAY_DOMAIN:443"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # ---- Telegram download bot: local Bot API server (req.9 step 1/3) ----
+      # The public Bot API caps bot uploads at 50 MB; the LOCAL server lifts that
+      # to 2000 MB and accepts an absolute file path in the file field, so the
+      # bot hands a 500 MB video to the API without a second copy on disk.
+      # Bind is 127.0.0.1:8081 only (network=host) - never published.
+      - name: Start local Telegram Bot API server
+        if: always()
+        continue-on-error: true
+        env:
+          TELEGRAM_API_ID: "147006"
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH || '' }}
+        run: |
+          set -uo pipefail
+          BOTROOT=/home/runner/dlbot
+          mkdir -p "$BOTROOT"/{files,tmp,logs}
+          if [ -z "${TELEGRAM_API_HASH:-}" ]; then
+            echo "::warning title=dlbot::TELEGRAM_API_HASH secret is not set - local Bot API server skipped"
+            exit 0
+          fi
+          if docker info >/dev/null 2>&1; then
+            docker rm -f dlbot-tgbotapi >/dev/null 2>&1 || true
+            docker run -d --name dlbot-tgbotapi --network host \
+              -e TELEGRAM_API_ID="$TELEGRAM_API_ID" \
+              -e TELEGRAM_API_HASH="$TELEGRAM_API_HASH" \
+              -e TELEGRAM_LOCAL=1 \
+              -e TELEGRAM_HTTP_PORT=8081 \
+              aiogram/telegram-bot-api:latest >/dev/null
+            echo "telegram-bot-api container started"
+          else
+            BIN=/home/runner/.hermes/tools/telegram-bot-api/bin/telegram-bot-api
+            if [ ! -x "$BIN" ]; then
+              command -v cmake >/dev/null 2>&1 || \
+                sudo apt-get install -y --no-install-recommends cmake g++ make zlib1g-dev libssl-dev 2>/dev/null || true
+              git clone --depth 1 -q https://github.com/tdlib/telegram-bot-api.git /home/runner/telegram-bot-api
+              cmake -S /home/runner/telegram-bot-api -B /home/runner/telegram-bot-api/build \
+                    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/home/runner/.hermes/tools/telegram-bot-api >/dev/null
+              cmake --build /home/runner/telegram-bot-api/build --target install -j"$(nproc)" >/dev/null
+            fi
+            pkill -f 'telegram-bot-api' || true
+            nohup "$BIN" --api-id="$TELEGRAM_API_ID" --api-hash="$TELEGRAM_API_HASH" --local \
+              --http-address=127.0.0.1 --http-port=8081 \
+              --dir="$BOTROOT/tgbotapi" --temp-dir="$BOTROOT/tmp" \
+              --log="$BOTROOT/logs/botapi.log" >>"$BOTROOT/logs/botapi.stdout" 2>&1 &
+            echo $! > "$BOTROOT/botapi.pid"
+            echo "telegram-bot-api built from source and started"
+          fi
+          for i in $(seq 1 20); do
+            curl -fsS --max-time 3 -o /dev/null \
+              "http://127.0.0.1:8081/bot${TELEGRAM_BOT_TOKEN}/getMe" && break || sleep 3
+          done
+          curl -fsS --max-time 5 "http://127.0.0.1:8081/bot${TELEGRAM_BOT_TOKEN}/getMe" \
+            | jq -c '{ok, username: .result.username, id: .result.id}' \
+            || echo "::warning title=dlbot::bot API server not answering on 127.0.0.1:8081"
+
+      # ---- Telegram download bot (req.9 step 2/3) ----
+      # Long polling: the bot needs no inbound connectivity, so tailscale and the
+      # Cloudflare tunnel are untouched. Code is pulled from this repo (the job
+      # has no checkout step) and copied to $BOTROOT.
+      - name: Start Telegram download bot
+        if: always()
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_API_ROOT: http://127.0.0.1:8081
+          DLBOT_ADMIN_ID: "180329538"
+        run: |
+          set -uo pipefail
+          BOTROOT=/home/runner/dlbot
+          mkdir -p "$BOTROOT"/{files,tmp,logs}
+          rm -rf "$BOTROOT/src"
+          if ! git clone --depth 1 -q \
+              "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/heydarsaki-dev/Personal.git" \
+              "$BOTROOT/src" 2>/dev/null; then
+            echo "::warning title=dlbot::could not clone bot code"
+          fi
+          if [ -d "$BOTROOT/src/dlbot" ]; then
+            cp -f "$BOTROOT/src/dlbot/"*.py "$BOTROOT/"
+            echo "bot code installed: $(ls "$BOTROOT"/*.py | wc -l) modules"
+          fi
+          if [ ! -f "$BOTROOT/bot.py" ]; then
+            echo "::warning title=dlbot::bot.py missing - nothing to start"
+            exit 0
+          fi
+          pkill -f "$BOTROOT/bot.py" || true
+          sleep 1
+          cd "$BOTROOT"
+          nohup python3 -u "$BOTROOT/bot.py" >>"$BOTROOT/logs/bot.log" 2>&1 &
+          echo $! > "$BOTROOT/bot.pid"
+          sleep 8
+          if kill -0 "$(cat "$BOTROOT/bot.pid")" 2>/dev/null; then
+            echo "bot alive pid $(cat "$BOTROOT/bot.pid")"
+          else
+            echo "::warning title=dlbot::bot exited during startup"
+          fi
+          tail -n 20 "$BOTROOT/logs/bot.log" 2>/dev/null || true
+
       - name: Keep alive
         continue-on-error: true
         run: |
@@ -1084,6 +1179,23 @@ jobs:
           fi
           pkill -f 'run-searxng.sh' 2>/dev/null || true
           pkill -f 'searx.webapp' 2>/dev/null || true
+
+      # ---- Telegram download bot: stop (req.9 step 3/3) ----
+      - name: Stop Telegram download bot and Bot API server
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          BOTROOT=/home/runner/dlbot
+          [ -f "$BOTROOT/bot.pid" ]    && kill -TERM "$(cat "$BOTROOT/bot.pid")"
+          [ -f "$BOTROOT/botapi.pid" ] && kill -TERM "$(cat "$BOTROOT/botapi.pid")"
+          sleep 3
+          pkill -f "$BOTROOT/bot.py" || true
+          pkill -f 'telegram-bot-api' || true
+          docker rm -f dlbot-tgbotapi >/dev/null 2>&1 || true
+          rm -f "$BOTROOT/bot.pid" "$BOTROOT/botapi.pid"
+          rm -rf "$BOTROOT/files" "$BOTROOT/tmp" "$BOTROOT/src"
+          echo "bot + Bot API server stopped, temp files removed"
 
       - name: Back up state to GitHub
         if: always()
