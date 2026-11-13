@@ -113,7 +113,7 @@ class Bot:
             else:
                 self.send_key(chat_id, "nothing_to_cancel")
         elif command == "/kill":
-            if user_id != self.cfg.admin_id and chat_id != self.cfg.admin_id:
+            if user_id != self.cfg.admin_id:
                 self.send_key(chat_id, "kill_denied")
                 return
             self.send_key(chat_id, "kill_done", time=time.strftime("%H:%M", time.gmtime()))
