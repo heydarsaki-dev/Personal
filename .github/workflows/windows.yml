@@ -29,40 +29,21 @@ jobs:
       RUN_MINUTES: ${{ inputs.run_minutes || '350' }}
       NODE_NAME: gh-win-vpn
       EXIT_TAG: tag:gh-exit
-      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
       HERMES_BACKUP_TOKEN: ${{ secrets.HERMES_BACKUP_TOKEN }}
       HERMES_BACKUP_REPO: heydarsaki-dev/HermesBackup
-      HERMES_MODEL: MyCombo
-      NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
-      HERMES_RESTART_DELAY: 10
-      OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
-      OMNIROUTE_MODEL: ${{ vars.OMNIROUTE_MODEL || 'MyCombo' }}
-      OMNIROUTE_VERSION: "3.8.53"
-      OMNIROUTE_PORT: "20128"
-      V2RAY_DOMAIN: ${{ vars.V2RAY_DOMAIN || 'vpn.heydarsaki.bond' }}
-      V2RAY_UUID: ${{ secrets.V2RAY_UUID || '' }}
-      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN || '' }}
-      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID || '' }}
-      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || '' }}
-      CF_TUNNEL_ID: ${{ secrets.CF_TUNNEL_ID || '' }}
-      V2RAY_PORT: "8080"
-      V2RAY_WS_PATH: "/v2ray"
-      SEARXNG_REPO: https://github.com/searxng/searxng.git
-      SEARXNG_ROOT: $env:USERPROFILE\.searxng
-      SEARXNG_PORT: "8888"
-      SEARXNG_URL: http://127.0.0.1:8888
-      JOB_TIMEOUT_MINUTES: "335"
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
       DLBOT_ROOT: $env:USERPROFILE\dlbot
       HERMES_HOME: $env:USERPROFILE\.hermes
     steps:
+      # ---------------------------------------------------------------- Record job start
       - name: Record job start
         shell: pwsh
         run: |
           "JOB_START_EPOCH=$(Get-Date -UFormat %s)" >> $env:GITHUB_ENV
           Write-Host "Job started at $(Get-Date -Format o) UTC"
 
+      # ---------------------------------------------------------------- Tailscale
       - name: Delete old tailnet nodes
         shell: pwsh
         continue-on-error: true
@@ -99,6 +80,7 @@ jobs:
           try { $pub = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10 } catch { $pub = "unknown" }
           "PUBLIC_IP=$pub" >> $env:GITHUB_ENV
 
+      # ---------------------------------------------------------------- v2ray
       - name: Install v2ray
         shell: pwsh
         if: env.V2RAY_DOMAIN != '' && env.V2RAY_UUID != ''
@@ -128,6 +110,7 @@ jobs:
           Start-Sleep -Seconds 5
           for ($i = 1; $i -le 20; $i++) { if (Test-NetConnection -ComputerName 127.0.0.1 -Port $env:V2RAY_PORT -InformationLevel Quiet) { break }; Start-Sleep -Seconds 1 }
 
+      # ---------------------------------------------------------------- Cloudflare Tunnel
       - name: Start Cloudflare Tunnel
         shell: pwsh
         if: env.V2RAY_DOMAIN != '' && env.CF_TUNNEL_ID != '' && env.CF_ACCOUNT_ID != '' && env.CF_API_TOKEN != ''
@@ -145,47 +128,7 @@ jobs:
           $conn = $false
           for ($i = 1; $i -le 60; $i++) { if (Select-String -Path "$env:USERPROFILE\cloudflared.log" -Pattern "Registered tunnel connection" -Quiet) { $conn = $true; break }; Start-Sleep -Seconds 2 }
 
-      - name: Cache SearXNG
-        shell: pwsh
-        uses: actions/cache@v4
-        continue-on-error: true
-        with:
-          path: ~/.searxng
-          key: searxng-${{ runner.os }}-py312-v1
-
-      - name: Install SearXNG
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $ROOT = $env:SEARXNG_ROOT
-          New-Item -ItemType Directory -Path $ROOT -Force | Out-Null
-          if (Test-Path "$ROOT\venv\Scripts\python.exe") { Write-Host "cached" } else {
-            Remove-Item -Recurse -Force "$ROOT\venv", "$ROOT\src" -ErrorAction SilentlyContinue
-            git clone --depth 1 -q $env:SEARXNG_REPO "$ROOT\src"
-            python3 -m venv "$ROOT\venv"
-            & "$ROOT\venv\Scripts\python.exe" -m pip install -U pip wheel
-            & "$ROOT\venv\Scripts\python.exe" -m pip install -r "$ROOT\src\requirements.txt"
-          }
-
-      - name: Generate SearXNG settings
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $ROOT = $env:SEARXNG_ROOT
-          if (Test-Path "$ROOT\settings.yml") { exit 0 }
-          $sec = [System.Web.Security.Membership]::GeneratePassword(64, 0)
-          $s = "use_default_settings: true`ngeneral:`n  instance_name: `"Hermes SearXgn`"`nsearch:`n  formats:`n    - html`n    - json`n  safe_search: 0`nserver:`n  bind_address: `"127.0.0.1`"`n  port: $env:SEARXNG_PORT`n  secret_key: `"$sec`"`n"
-          Set-Content -Path "$ROOT\settings.yml" -Value $s
-
-      - name: Start SearXNG
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $ROOT = $env:SEARXNG_ROOT
-          Start-Process powershell.exe -ArgumentList "-NoExit", "-Command", "`$env:SEARXNG_SETTINGS_PATH=`"$ROOT\settings.yml`"; Set-Location `"$ROOT\src`"; & `"$ROOT\venv\Scripts\python.exe`" -m searx.webapp >> `"$env:USERPROFILE\searxng.log`" 2>&1`"" -WindowStyle Hidden
-          $ready = $false
-          for ($i = 1; $i -le 60; $i++) { if (Invoke-RestMethod -Uri "$env:SEARXNG_URL/search?q=ok&format=json" -TimeoutSec 5 -ErrorAction SilentlyContinue) { $ready = $true; break }; Start-Sleep -Seconds 1 }
-
+      # ---------------------------------------------------------------- Restore Hermes state
       - name: Restore state from backup
         shell: pwsh
         id: restore
@@ -195,79 +138,15 @@ jobs:
           $work = [System.IO.Path]::GetTempFileName(); Remove-Item $work; New-Item -ItemType Directory -Path $work -Force | Out-Null
           git clone --quiet --depth 1 "https://x-access-token:***" $work 2>$null | Out-Null
           if (Test-Path "$work\hermes-state.zip") { Copy-Item "$work\hermes-state.zip" "$env:USERPROFILE\hermes-restore.zip"; "RESTORE_ZIP=$env:USERPROFILE\hermes-restore.zip" >> $env:GITHUB_ENV }
-          if (Test-Path "$work\omniroute-state.zip") { Expand-Archive -Path "$work\omniroute-state.zip" -DestinationPath $env:USERPROFILE -Force }
           Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 
-      - name: Cache Hermes runtime
-        shell: pwsh
-        uses: actions/cache@v4
-        continue-on-error: true
-        with:
-          path: |
-            ~/.hermes/tools
-            ~/.hermes/cache/uv
-            ~/.hermes/installs
-          key: hermes-${{ runner.os }}-tools-v1
-
-      - name: Set up Node.js
-        shell: pwsh
-        uses: actions/setup-node@v4
-        continue-on-error: true
-        with:
-          node-version: "24"
-
-      - name: Cache npm
-        shell: pwsh
-        uses: actions/cache@v4
-        continue-on-error: true
-        with:
-          path: ~/.npm
-          key: npm-${{ runner.os }}-node24-${{ env.OMNIROUTE_VERSION }}
-
-      - name: Cache OmniRoute
-        shell: pwsh
-        uses: actions/cache@v4
-        continue-on-error: true
-        with:
-          path: ~/omniroute-app
-          key: omniroute-${{ runner.os }}-node24-${{ env.OMNIROUTE_VERSION }}
-
-      - name: Install OmniRoute
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $bin = "$env:USERPROFILE\omniroute-app\node_modules\.bin\omniroute.cmd"
-          if (-not (Test-Path $bin)) { npm install --prefix "$env:USERPROFILE\omniroute-app" --no-audit --no-fund "omniroute@$env:OMNIROUTE_VERSION" }
-          & $bin --version || true
-
-      - name: Patch OmniRoute footer
-        shell: pwsh
-        run: |
-          $file = Join-Path $env:USERPROFILE "omniroute-app/node_modules/omniroute/open-sse/handlers/chatCore/nonStreamingResponse.ts"
-          if (Test-Path $file) {
-            $c = Get-Content -Path $file -Raw
-            $t = "if (echoModel) echoModelInObject(translatedResponse, echoModel);"
-            $a = "`n    if (responseModel && typeof translatedResponse === `"`"object`"`" && translatedResponse !== null) {`n      (translatedResponse as Record<string, unknown>).served_model = responseModel;`n    }"
-            if (-not $c.Contains("served_model = responseModel")) { Set-Content -Path $file -Value ($c.Replace($t, $t + $a)); Write-Host "patched" }
-          }
-
-      - name: Start OmniRoute
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          New-Item -ItemType Directory -Path "$env:USERPROFILE\.omniroute" -Force | Out-Null
-          $env:DATA_DIR = "$env:USERPROFILE\.omniroute"
-          $env:PORT = $env:OMNIROUTE_PORT
-          Start-Process powershell.exe -ArgumentList "-NoExit", "-Command", "& `"$env:USERPROFILE\omniroute-app\node_modules\.bin\omniroute.cmd`" serve --no-open >> `"$env:USERPROFILE\omniroute.log`" 2>&1`"" -WindowStyle Hidden
-          $h = $false
-          for ($i = 1; $i -le 90; $i++) { if (Invoke-RestMethod -Uri "http://127.0.0.1:$env:OMNIROUTE_PORT/api/monitoring/health" -TimeoutSec 5 -ErrorAction SilentlyContinue) { $h = $true; break }; Start-Sleep -Seconds 2 }
-
-      - name: Install Hermes Agent
+      # ---------------------------------------------------------------- Hermes Desktop
+      - name: Install Hermes Agent with Desktop
         shell: pwsh
         continue-on-error: true
         run: |
           Invoke-WebRequest -Uri "https://hermes-agent.nousresearch.com/install.sh" -OutFile "$env:TEMP\hermes-install.sh"
-          bash "$env:TEMP\hermes-install.sh" --non-interactive --skip-browser --skip-computer-use
+          bash "$env:TEMP\hermes-install.sh" --non-interactive --skip-browser --skip-computer-use --include-desktop
           "$env:USERPROFILE\.local\bin" >> $env:GITHUB_PATH
           & "$env:USERPROFILE\.local\bin\hermes" --version
 
@@ -283,17 +162,22 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path "$env:HERMES_HOME" -Force | Out-Null
           & "$env:USERPROFILE\.local\bin\hermes" config set model.provider custom
-          & "$env:USERPROFILE\.local\bin\hermes" config set model.base_url "http://127.0.0.1:$env:OMNIROUTE_PORT/v1"
-          & "$env:USERPROFILE\.local\bin\hermes" config set model.api_key "$env:OMNIROUTE_API_KEY"
           & "$env:USERPROFILE\.local\bin\hermes" config set model.default "MyCombo"
-          & "$env:USERPROFILE\.local\bin\hermes" config set web.backend searxng
+          if ($env:TELEGRAM_BOT_TOKEN) {
+            & "$env:USERPROFILE\.local\bin\hermes" config set platforms.telegram.enabled true
+            & "$env:USERPROFILE\.local\bin\hermes" config set platforms.telegram.home_channel.chat_id "$env:TELEGRAM_USER_ID"
+            & "$env:USERPROFILE\.local\bin\hermes" config set platforms.telegram.home_channel.name "$env:TELEGRAM_USER_ID"
+            & "$env:USERPROFILE\.local\bin\hermes" config set platforms.telegram.home_channel.user_id "$env:TELEGRAM_USER_ID"
+          }
 
-      - name: Start Hermes gateway
+      - name: Start Hermes gateway (headless CLI)
         shell: pwsh
         continue-on-error: true
         run: |
+          New-Item -ItemType Directory -Path "$env:USERPROFILE\.hermes\logs" -Force | Out-Null
           Start-Process "$env:USERPROFILE\.local\bin\hermes" -ArgumentList "gateway", "run", "--replace" -RedirectStandardOutput "$env:USERPROFILE\.hermes\logs\gateway.log" -RedirectStandardError "$env:USERPROFILE\.hermes\logs\gateway.err" -WindowStyle Hidden
 
+      # ---------------------------------------------------------------- Telegram download bot
       - name: Start local Telegram Bot API server
         shell: pwsh
         if: always()
@@ -327,6 +211,7 @@ jobs:
           Start-Process python3.exe -ArgumentList "-u", "$botRoot\bot.py" -RedirectStandardOutput "$botRoot\logs\bot.log" -RedirectStandardError "$botRoot\logs\bot.log" -WindowStyle Hidden
           Start-Sleep -Seconds 8
 
+      # ---------------------------------------------------------------- Keep alive
       - name: Keep alive
         shell: pwsh
         continue-on-error: true
@@ -339,18 +224,19 @@ jobs:
           $end = [datetime]::Now.AddSeconds($wait)
           while ([datetime]::Now -lt $end) { Start-Sleep -Seconds 60 }
 
+      # ---------------------------------------------------------------- Stops (if: always())
       - name: Stop all
         shell: pwsh
         if: always()
         continue-on-error: true
         run: |
           Get-Process hermes -ErrorAction SilentlyContinue | Stop-Process -Force
-          Get-Process omniroute -ErrorAction SilentlyContinue | Stop-Process -Force
           Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
           Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like "*bot.py*" } | Stop-Process -Force
           Get-Process telegram-bot-api -ErrorAction SilentlyContinue | Stop-Process -Force
           Remove-Item -Recurse -Force "$env:DLBOT_ROOT\files", "$env:DLBOT_ROOT\tmp", "$env:DLBOT_ROOT\src" -ErrorAction SilentlyContinue
 
+      # ---------------------------------------------------------------- Back up state to GitHub
       - name: Back up state to GitHub
         shell: pwsh
         if: always()
