@@ -93,13 +93,7 @@ jobs:
       - name: Establish Tailscale Connection
         run: |
           # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up \
-            --authkey="$TS_AUTHKEY" \
-            --hostname="$NODE_NAME" \
-            --advertise-exit-node \
-            --advertise-tags="$EXIT_TAG" \
-            --accept-dns=false \
-            --timeout=60s
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up  --authkey="$TS_AUTHKEY" --hostname="$NODE_NAME" --advertise-exit-node --advertise-tags="$EXIT_TAG" --accept-dns=false --timeout=60s
          
           # Wait for Tailscale to assign an IP
           $tsIP = $null
