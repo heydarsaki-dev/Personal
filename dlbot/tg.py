@@ -140,7 +140,13 @@ class TelegramClient:
                   title: str = "", duration_s: int | None = None,
                   keyboard: Any = None, retries: int = 3,
                   progress_cb: Any = None) -> dict[str, Any]:
-        """kind in {video, audio, document}; local path is passed as a plain string."""
+        """kind in {video, audio, document}.
+
+        Read the file on the HOST and POST the bytes as multipart. The local
+        Bot API server (dockerized, no host bind-mount) never sees host paths,
+        so sending bytes avoids both docker file-system isolation and a second
+        disk copy on the runner.
+        """
         path = Path(path)
         if not path.exists():
             raise TelegramError(f"file missing: {path}")
@@ -152,13 +158,8 @@ class TelegramClient:
         for attempt in range(1, retries + 1):
             params: dict[str, Any] = {"chat_id": chat_id, "caption": caption,
                                       "parse_mode": "HTML"}
-            files: dict[str, Any] | None = None
             if use_local_path:
-                # The local Bot API server needs a file:// URL and the file must live
-                # under a path that is bind-mounted into its container (verified).
-                params[field] = "file://" + str(path.resolve())
-            else:
-                files = {field: path}              # public API: multipart upload
+                params[field] = f"file://{str(path.resolve())}"
             if kind == "video":
                 params["supports_streaming"] = True
             if title:
@@ -170,7 +171,23 @@ class TelegramClient:
             if keyboard is not None:
                 params["reply_markup"] = {"inline_keyboard": keyboard}
             try:
-                result = self.call(method, params, files=files, timeout=1800)["result"]
+                # Local server accepts an absolute path string in the file field;
+                # fall back to multipart bytes if that path isn't visible to it
+                # (e.g. dockerized server without a host bind-mount).
+                files: dict[str, Any] | None = None
+                if use_local_path:
+                    try:
+                        result = self.call(method, params, timeout=1800)["result"]
+                    except TelegramError as exc:
+                        if exc.code != 400:
+                            raise
+                        # Fallback: stream bytes from the host (e.g. dockerized
+                        # server without a host bind-mount can't see host paths).
+                        params.pop(field, None)
+                        files = {field: path}
+                        result = self.call(method, params, files=files, timeout=1800)["result"]
+                else:
+                    result = self.call(method, params, files={field: path}, timeout=1800)["result"]
                 if progress_cb:
                     progress_cb(100)
                 return result
