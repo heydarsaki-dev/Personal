@@ -82,7 +82,16 @@ jobs:
                 curl.exe -fsSL -X DELETE -H "Authorization: Bearer $token" `
                   "https://api.tailscale.com/api/v2/device/$($_.id)"
                 Write-Output "removed stale node $($_.id)"
-              }    
+              } 
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+         
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
       - name: Establish Tailscale Connection
         run: |
           # Bring up Tailscale with the provided auth key and set a unique hostname
