@@ -1030,6 +1030,7 @@ jobs:
           if docker info >/dev/null 2>&1; then
             docker rm -f dlbot-tgbotapi >/dev/null 2>&1 || true
             docker run -d --name dlbot-tgbotapi --network host \
+              -v /home/runner/dlbot:/home/runner/dlbot \
               -e TELEGRAM_API_ID="$TELEGRAM_API_ID" \
               -e TELEGRAM_API_HASH="$TELEGRAM_API_HASH" \
               -e TELEGRAM_LOCAL=1 \
