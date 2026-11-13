@@ -1,4 +1,16 @@
-name: Windows 
+name: Windows
+
+# Windows node on a GitHub-hosted runner (the Linux counterpart is server.yml).
+#
+# Current scope: M2 - node skeleton correctness only. Deliberately NOT implemented
+# yet (blocked on the CEO decisions in windows-port-plan.md section 9):
+# Hermes Agent, OmniRoute, SearXNG, v2ray, cloudflared, Freebuff.
+#
+# Two rules this file must keep:
+#   * one stable tailnet identity (NODE_NAME=gh-win) so the stale-node cleanup can
+#     find the previous incarnation of this node;
+#   * the job always ends on its own (bounded keep-alive) so the always() teardown
+#     steps run - a job killed by timeout-minutes saves nothing.
 
 on:
   workflow_dispatch:
@@ -12,7 +24,7 @@ on:
     # (360 min later) cannot cancel this one through the concurrency group.
     - cron: "0 */6 * * *"      # fresh node every 6h, replaces the dying one
 concurrency:
-  group: Windows 
+  group: Windows
   cancel-in-progress: false     # never cancel a running node: a cancelled job saves no cache
 
 permissions:
@@ -27,9 +39,26 @@ jobs:
       TS_TAILNET: ${{ secrets.TS_TAILNET || '-' }}
       TS_CLIENT_ID: ${{ secrets.TS_CLIENT_ID }}
       TS_CLIENT_SECRET: ${{ secrets.TS_CLIENT_SECRET }}
-      
+      RUN_MINUTES: ${{ inputs.run_minutes || '350' }}
+      # Stable node identity. Never a per-run value: the cleanup step matches
+      # devices on exactly this name, and MagicDNS must resolve to one node.
+      NODE_NAME: gh-win
+      # Wall-clock budget for the whole job. Keep alive measures the remaining
+      # time from JOB_START_EPOCH (job start, not step start), so the job always
+      # exits with margin left for the stop/backup steps.
+      JOB_TIMEOUT_MINUTES: "335"
     steps:
+      - name: Record job start
+        shell: pwsh
+        run: |
+          # GITHUB_ENV only affects LATER steps, so keep the value in a variable too.
+          $startEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          "JOB_START_EPOCH=$startEpoch" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "job start epoch recorded: $startEpoch (budget $env:JOB_TIMEOUT_MINUTES min)"
+
       - name: Configure Core RDP Settings
+        shell: pwsh
         run: |
           # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
@@ -41,7 +70,7 @@ jobs:
 
           # Remove any existing rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
-         
+
           # For testing, allow any incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
@@ -50,6 +79,7 @@ jobs:
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Fixed Password
+        shell: pwsh
         run: |
           $password = "${{ secrets.RDP_PASSWORD }}"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
@@ -58,74 +88,130 @@ jobs:
           }
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-         
+
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-         
+
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
               exit 1
           }
+
       - name: Delete old tailnet nodes
         continue-on-error: true
         shell: pwsh
         run: |
+          # Deletes the previous incarnation of THIS node so the stable hostname
+          # (gh-win) always resolves to exactly one device. Real API endpoints:
+          #   token  POST   /api/v2/oauth/token
+          #   list   GET    /api/v2/tailnet/<tailnet>/devices
+          #   delete DELETE /api/v2/device/<id>
+          # Matching: the value passed to `tailscale up --hostname` lands in the
+          # device's `hostname` field; `name` is the MagicDNS FQDN (first label
+          # equals the node name) and `givenName` is an admin rename. Match all
+          # three so a renamed node is still cleaned up, and log the count so a
+          # silent no-op (the old bug) is visible in the log.
+          if (-not $env:NODE_NAME) {
+              Write-Host "::warning title=Tailnet cleanup::NODE_NAME is empty - refusing to delete anything"
+              exit 0
+          }
+          $tailnet = $env:TS_TAILNET
+          if (-not $tailnet) { $tailnet = '-' }   # '-' = default tailnet of the token
+
           $tokenResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/oauth/token" `
             -Method Post `
+            -ContentType "application/x-www-form-urlencoded" `
             -Body @{
               client_id     = $env:TS_CLIENT_ID
               client_secret = $env:TS_CLIENT_SECRET
               grant_type    = "client_credentials"
             }
-          
+
           $headers = @{
             Authorization = "Bearer $($tokenResponse.access_token)"
           }
 
-          $devicesResponse = Invoke-RestMethod -Uri "https://tailscale.com" `
+          $devicesResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tailnet/devices" `
             -Method Get `
             -Headers $headers
 
-          $staleDevices = $devicesResponse.devices | Where-Object { $_.hostname -eq $env:NODE_NAME }
+          $devices = @($devicesResponse.devices)
+          Write-Host "tailnet '$tailnet' currently lists $($devices.Count) device(s)"
+
+          $staleDevices = @($devices | Where-Object {
+              $_.hostname -eq $env:NODE_NAME -or
+              $_.givenName -eq $env:NODE_NAME -or
+              ($_.name -and ($_.name -split '\.')[0] -eq $env:NODE_NAME)
+            })
+
+          if ($staleDevices.Count -eq 0) {
+              Write-Host "no stale '$($env:NODE_NAME)' device in the tailnet - nothing to delete"
+              exit 0
+          }
 
           foreach ($device in $staleDevices) {
-            Invoke-RestMethod -Uri "https://tailscale.com" `
+            Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/device/$($device.id)" `
               -Method Delete `
               -Headers $headers
-            Write-Output "removed stale node $($device.id)"
+            Write-Output "removed stale node $($device.id) hostname=$($device.hostname) name=$($device.name)"
           }
+          Write-Host "removed $($staleDevices.Count) stale '$($env:NODE_NAME)' device(s)"
+
       - name: Install Tailscale
+        shell: pwsh
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.104.7-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-         
+
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
+        shell: pwsh
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TS_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-         
+          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          # Stable hostname (NODE_NAME), never the run id: a brand-new identity
+          # every 6h is what filled the tailnet with gh-runner-* leftovers.
+          & $tsExe up --authkey=$env:TS_AUTHKEY --hostname=$env:NODE_NAME
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "tailscale up failed (exit $LASTEXITCODE)"
+              exit 1
+          }
+
           # Wait for Tailscale to assign an IP
           $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          for ($i = 0; $i -lt 10 -and -not $tsIP; $i++) {
+              $tsIP = (& $tsExe ip -4 2>$null | Select-Object -First 1)
+              if (-not $tsIP) { Start-Sleep -Seconds 5 }
           }
-         
+
           if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-     
+
+          # MagicDNS name, trailing dot stripped (used in the job summary)
+          $dnsName = ""
+          try {
+              $status = & $tsExe status --json 2>$null | ConvertFrom-Json
+              $dnsName = ($status.Self.DNSName -replace '\.$', '')
+          } catch {
+              Write-Host "::warning title=Tailscale::could not read MagicDNS name from status --json"
+          }
+
+          @(
+            "TAILSCALE_IP=$tsIP"
+            "TAILSCALE_DNSNAME=$dnsName"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "tailscale up as $env:NODE_NAME -> $tsIP ($dnsName)"
+
       - name: Verify RDP Accessibility
+        shell: pwsh
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-         
+
           # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
@@ -134,12 +220,38 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
+      - name: Publish address
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ip  = if ($env:TAILSCALE_IP) { $env:TAILSCALE_IP } else { "unknown" }
+          $dns = if ($env:TAILSCALE_DNSNAME) { $env:TAILSCALE_DNSNAME } else { "$($env:NODE_NAME)" }
+
+          # No secret values here: the repo is public, and the job summary is
+          # world-readable for anyone who can see the run.
+          @(
+            "### Windows node is up"
+            ""
+            "| field | value |"
+            "| --- | --- |"
+            "| Node name | ``$($env:NODE_NAME)`` |"
+            "| Tailnet address | ``$ip`` |"
+            "| MagicDNS name | ``$dns`` |"
+            "| RDP | ``$ip`:3389`` - user ``RDP``, password = repo secret ``RDP_PASSWORD`` |"
+            "| Job budget | $($env:JOB_TIMEOUT_MINUTES) min (bounded keep-alive) |"
+            ""
+            "> Hermes / OmniRoute / SearXNG / v2ray / cloudflared are not part of this workflow yet (M2)."
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          Write-Host "job summary published: $dns ($ip)"
+
       - name: Maintain Connection + Watch RDP User
+        shell: pwsh
         run: |
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Address: $env:TAILSCALE_IP (MagicDNS: $env:TAILSCALE_DNSNAME)"
           Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Password: RDP_PASSWORD repository secret (masked in logs; endpoint published in the job summary)"
           Write-Host "==================`n"
 
           $rdpProfile = "C:\Users\RDP"
@@ -147,34 +259,136 @@ jobs:
           $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
           $downloadPath = "$startupPath\Downloads.bat"
 
-          while ($true) {
-              if (Test-Path $rdpProfile) {
-                  try {
-                      if (-not (Test-Path $startupPath)) {
-                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
-                      }
-
-                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
-                      Write-Host "? Downloads.bat copied to $downloadPath"
-
-                      # Run the batch file for the first time
-                      cmd /c $downloadPath
-                      Write-Host "? Downloads.bat executed successfully"
-                      break
-                  }
-                  catch {
-                      Write-Host "? Error copying or executing Downloads.bat: $($_.Exception.Message)"
-                      break
-                  }
-              }
-              else {
-                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
-                  Start-Sleep -Seconds 30
-              }
+          # The profile only appears after the first interactive RDP login. Wait
+          # for it, but bounded: an unbounded wait here would eat the whole job
+          # budget and the keep-alive/teardown would never run.
+          $profileWaitMinutes = 30
+          $profileDeadline = (Get-Date).AddMinutes($profileWaitMinutes)
+          while (-not (Test-Path $rdpProfile) -and (Get-Date) -lt $profileDeadline) {
+              Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
+              Start-Sleep -Seconds 30
           }
 
-          # Keep runner alive
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+          if (Test-Path $rdpProfile) {
+              try {
+                  if (-not (Test-Path $startupPath)) {
+                      New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+                  }
+
+                  Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+                  Write-Host "Downloads.bat copied to $downloadPath"
+
+                  # Run the batch file for the first time
+                  cmd /c $downloadPath
+                  Write-Host "Downloads.bat executed successfully"
+              }
+              catch {
+                  Write-Host "Error copying or executing Downloads.bat: $($_.Exception.Message)"
+              }
           }
+          else {
+              Write-Host "::warning title=RDP::profile $rdpProfile not created within $profileWaitMinutes min - Downloads.bat hook skipped"
+          }
+
+      - name: Keep alive
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          # Anchored to the JOB START (JOB_START_EPOCH), not to this step: the
+          # setup time must be charged against the budget. WAIT = min(requested,
+          # remaining), so the workflow always ends with time left for the
+          # stop/backup steps and finishes "success" instead of being killed by
+          # timeout-minutes (a cancelled job saves no cache).
+          $startEpoch = $env:JOB_START_EPOCH
+          if (-not $startEpoch) {
+              Write-Host "::warning title=Timing::JOB_START_EPOCH missing - measuring elapsed time from now"
+              $startEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          }
+          $budget    = [int64]$env:JOB_TIMEOUT_MINUTES * 60
+          $elapsed   = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$startEpoch
+          $remain    = $budget - $elapsed
+          $requested = [int64]$env:RUN_MINUTES * 60 - 300
+          $wait      = [Math]::Min($requested, $remain)
+          if ($wait -lt 60) {
+              Write-Host "::warning title=Timing::only $remain s of job budget left - skipping keep-alive"
+              exit 0
+          }
+          Write-Host "keeping alive for $([int]($wait / 60)) min (elapsed $([int]($elapsed / 60)) min, budget $($env:JOB_TIMEOUT_MINUTES) min)"
+
+          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          function Test-TcpPort([string]$TargetHost, [int]$Port, [int]$TimeoutMs = 3000) {
+              $client = New-Object System.Net.Sockets.TcpClient
+              try {
+                  $task = $client.ConnectAsync($TargetHost, $Port)
+                  if ($task.Wait($TimeoutMs) -and $client.Connected) { return "ok" }
+                  return "down"
+              }
+              catch { return "down" }
+              finally { $client.Dispose() }
+          }
+
+          $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + $wait
+          while ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt $deadline) {
+              $ts = "down"
+              if (Test-Path $tsExe) {
+                  & $tsExe status *> $null
+                  if ($LASTEXITCODE -eq 0) { $ts = "ok" }
+              }
+              $rdp = Test-TcpPort -TargetHost $env:TAILSCALE_IP -Port 3389
+              $left = [int](($deadline - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) / 60)
+              $clock = (Get-Date).ToUniversalTime().ToString("HH:mm:ss")
+              Write-Host "[$clock] ${env:NODE_NAME} up at $env:TAILSCALE_IP | tailscale $ts | rdp3389 $rdp | ${left} min left"
+              Start-Sleep -Seconds 60
+          }
+          Write-Host "keep-alive finished - handing over to the always() teardown steps"
+
+      # ---- Teardown: must run even when an earlier step failed ----
+      # Logout runs BEFORE the service stop on purpose: the CLI talks to the
+      # daemon over a local API, so `tailscale logout` fails once the service is
+      # down. Deauthorising the node is what keeps the tailnet free of ghost
+      # devices between runs.
+      - name: Leave tailnet (tailscale logout)
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $tsExe)) {
+              Write-Host "tailscale.exe not installed - nothing to log out"
+              exit 0
+          }
+          & $tsExe logout
+          Write-Host "tailscale logout exit code: $LASTEXITCODE"
+
+      - name: Stop Tailscale services
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          foreach ($name in @("Tailscale", "Tailscale-IPN")) {
+              $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+              if ($svc -and $svc.Status -ne "Stopped") {
+                  Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
+                  Write-Host "stopped service $name"
+              }
+          }
+          # Tray/UI process, if it was ever started
+          Get-Process -Name "tailscale-ipn" -ErrorAction SilentlyContinue |
+              ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+          Write-Host "tailscale services stopped"
+
+      # ---- PLACEHOLDER: real backup lands in M3+ (needs the CEO backup contract) ----
+      # Target file names, mirroring the Linux names in server.yml:
+      #   windows-hermes-state.zip     <- hermes backup -o windows-hermes-state.zip
+      #   windows-omniroute-state.zip  <- zip of %USERPROFILE%\.omniroute (OmniRoute DATA_DIR)
+      # Windows must push ONLY these two names, so the Linux zips in HermesBackup
+      # stay untouched. Nothing is produced or uploaded yet.
+      - name: Back up state to GitHub
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Write-Host "backup placeholder (M2): no state captured yet"
+          Write-Host "  would write: windows-hermes-state.zip, windows-omniroute-state.zip"
+          Write-Host "  would push only those names to HermesBackup (Linux zips untouched)"
