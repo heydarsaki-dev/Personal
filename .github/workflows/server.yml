@@ -655,18 +655,45 @@ jobs:
           fi
           work="$(mktemp -d)"
           if ! git clone --quiet --depth 1 \
-              "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git" "$work"; then
+              "https://x-access-token:***" "$work"; then
             echo "No readable backup repo - fresh start"
             rm -rf "$work"
             exit 0
           fi
-          if [ -f "$work/hermes-state.zip" ]; then
-            cp "$work/hermes-state.zip" "$HOME/hermes-restore.zip"
+          # Pick the newest zip across both machines (linux + windows write separate timestamped files)
+          best_zip=""; best_stamp=""
+          for f in "$work"/hermes-state-*.zip; do
+            [ -f "$f" ] || continue
+            stamp="${f##hermes-state-}"
+            stamp="${stamp%.zip}"
+            if [ -z "$best_stamp" ] || [ "$stamp" \> "$best_stamp" ]; then
+              best_stamp="$stamp"
+              best_zip="$f"
+            fi
+          done
+          if [ -n "$best_zip" ]; then
+            cp "$best_zip" "$HOME/hermes-restore.zip"
             echo "RESTORE_ZIP=$HOME/hermes-restore.zip" >> "$GITHUB_ENV"
+            echo "restoring ${best_zip##*/} (stamp $best_stamp)"
+          else
+            echo "no backup zip found - starting from scratch"
           fi
-          if [ -f "$work/omniroute-state.zip" ]; then
-            unzip -oq "$work/omniroute-state.zip" -d "$HOME"
-            chmod 600 "$HOME/.omniroute/.env" 2>/dev/null || true
+          if compgen -G "$work/omniroute-state-*.zip" > /dev/null; then
+            best_omni=""; best_ostamp=""
+            for f in "$work"/omniroute-state-*.zip; do
+              [ -f "$f" ] || continue
+              ostamp="${f##omniroute-state-}"
+              ostamp="${ostamp%.zip}"
+              if [ -z "$best_ostamp" ] || [ "$ostamp" \> "$best_ostamp" ]; then
+                best_ostamp="$ostamp"
+                best_omni="$f"
+              fi
+            done
+            if [ -n "$best_omni" ]; then
+              unzip -oq "$best_omni" -d "$HOME"
+              chmod 600 "$HOME/.omniroute/.env" 2>/dev/null || true
+              echo "restoring ${best_omni##*/}"
+            fi
           fi
           rm -rf "$work"
 
@@ -1221,18 +1248,18 @@ jobs:
           rm -rf "$out"; mkdir -p "$out"
           ok=1
           if [ -x "$HOME/.local/bin/hermes" ]; then
-            if ! ~/.local/bin/hermes backup -o "$out/hermes-state.zip"; then
+            if ! ~/.local/bin/hermes backup -o "$out/hermes-state-${stamp}.zip"; then
               echo "::warning title=Backup::hermes backup failed"
               ok=0
             fi
           fi
           if [ -x "$HOME/omniroute-app/node_modules/.bin/omniroute" ] && [ -d "$HOME/.omniroute" ]; then
-            if ! ( cd "$HOME" && zip -qr "$out/omniroute-state.zip" .omniroute -x '.omniroute/logs/*' ); then
+            if ! ( cd "$HOME" && zip -qr "$out/omniroute-state-${stamp}.zip" .omniroute -x '.omniroute/logs/*' ); then
               echo "::warning title=Backup::omniroute backup failed"
               ok=0
             fi
           fi
-          if [ ! -f "$out/hermes-state.zip" ] && [ ! -f "$out/omniroute-state.zip" ]; then
+          if [ ! -f "$out/hermes-state-${stamp}.zip" ] && [ ! -f "$out/omniroute-state-${stamp}.zip" ]; then
             echo "no state captured - leaving existing backup untouched"
             exit 0
           fi
@@ -1246,25 +1273,39 @@ jobs:
           branch=${branch:-main}
           work="$RUNNER_TEMP/state-push"
           rm -rf "$work"
-          if ! git clone --quiet \
-              "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git" "$work" 2>/dev/null; then
-            mkdir -p "$work"
-            git -C "$work" init -q
-            git -C "$work" remote add origin \
-              "https://x-access-token:${HERMES_BACKUP_TOKEN}@github.com/${HERMES_BACKUP_REPO}.git"
+          push_ok=0
+          for attempt in 1 2; do
+            if git clone --quiet \
+                "https://x-access-token:***" "$work" 2>/dev/null; then
+              cd "$work"
+              git fetch --quiet origin "$branch" 2>/dev/null || true
+              git checkout -q "$branch" 2>/dev/null || git checkout -qb "$branch" 2>/dev/null || true
+              cp "$out"/*.zip ./
+              git add -f ./*.zip
+              if git -c user.name=github-actions -c user.email=github-actions@github.com \
+                  commit -q -m "state ${stamp}" 2>/dev/null; then
+                if git push -q origin "$branch" 2>/dev/null; then
+                  push_ok=1
+                  echo "state (${stamp}) pushed to ${HERMES_BACKUP_REPO}"
+                  break
+                else
+                  echo "push rejected (non-fast-forward); re-cloning and retrying (attempt $attempt)"
+                  cd /
+                  rm -rf "$work"
+                fi
+              else
+                echo "no changes to commit"
+                push_ok=1
+                break
+              fi
+            else
+              echo "clone failed (attempt $attempt)"
+              sleep 2
+            fi
+          done
+          if [ "$push_ok" != 1 ]; then
+            echo "::warning title=Backup::push failed after retries - state not saved"
           fi
-          cd "$work"
-          cp "$out"/*.zip ./
-          git add -f ./*.zip
-          git -c user.name=github-actions -c user.email=github-actions@github.com \
-            commit -q -m "state ${stamp}" || { echo "no changes to commit"; exit 0; }
-          git branch -M "$branch"
-          git push -q --force origin "$branch"
-          git ls-remote --heads origin | awk '{print $2}' | sed 's|refs/heads/||' \
-            | while read -r b; do
-                [ "$b" = "$branch" ] || git push -q origin --delete "$b" || true
-              done
-          echo "state (${stamp}) pushed to ${HERMES_BACKUP_REPO}"
 
       - name: Prune superseded Hermes environments
         if: always()

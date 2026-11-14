@@ -31,9 +31,6 @@ jobs:
       EXIT_TAG: tag:gh-exit
       HERMES_BACKUP_TOKEN: ${{ secrets.HERMES_BACKUP_TOKEN }}
       HERMES_BACKUP_REPO: heydarsaki-dev/HermesBackup
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-      DLBOT_ROOT: $env:USERPROFILE\dlbot
       HERMES_HOME: $env:USERPROFILE\.hermes
     steps:
       # ---------------------------------------------------------------- Record job start
@@ -61,14 +58,31 @@ jobs:
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.104.7-amd64.msi" -OutFile "$env:TEMP\tailscale.msi"
           Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\tailscale.msi`"", "/quiet", "/norestart" -Wait
 
-      - name: Join tailnet as exit node
+      - name: Join tailnet (route via gh-vpn exit node if reachable, else self)
         shell: pwsh
         continue-on-error: true
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
           for ($i = 1; $i -le 30; $i++) { if (& $ts status 2>$null) { break }; Start-Sleep -Seconds 1 }
-          & $ts up --authkey=$env:TS_AUTHKEY --hostname=$env:NODE_NAME --advertise-exit-node --advertise-tags=$env:EXIT_TAG --accept-dns=false --timeout=60s
+          & $ts up --authkey=$env:TS_AUTHKEY --hostname=$env:NODE_NAME --accept-dns=false --timeout=60s
           Start-Sleep -Seconds 3
+          # Prefer routing through gh-vpn (Linux) as the shared exit node; fall back to self
+          $ghVpn = $null
+          try {
+            $tokenResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/oauth/token" -Method Post -Body @{ client_id = $env:TS_CLIENT_ID; client_secret = $env:TS_CLIENT_SECRET; grant_type = "client_credentials" }
+            $headers = @{ Authorization = "Bearer $($tokenResponse.access_token)" }
+            $devices = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$env:TS_TAILNET/devices" -Headers $headers
+            $ghVpn = $devices.devices | Where-Object { $_.hostname -eq "gh-vpn" } | Select-Object -First 1
+          } catch { }
+          if ($ghVpn -and $ghVpn.addresses) {
+            $exitIp = ($ghVpn.addresses | Where-Object { $_ -match '^\d+\.' })[0]
+            if ($exitIp) { & $ts set --exit-node=$exitIp; Write-Host "exit node set to $exitIp (gh-vpn)" }
+          }
+          if (-not ($tsStat = & $ts status)) { $tsStat = "" }
+          if ($tsStat -notmatch "exitNode") {
+            & $ts up --advertise-exit-node --advertise-tags=$env:EXIT_TAG --timeout=60s
+            Write-Host "gh-vpn unreachable; advertising self ($env:NODE_NAME) as exit node"
+          }
           $ip = & $ts ip -4
           "NODE_IP=$ip" >> $env:GITHUB_ENV
 
@@ -137,7 +151,12 @@ jobs:
           if ([string]::IsNullOrEmpty($env:HERMES_BACKUP_TOKEN)) { exit 0 }
           $work = [System.IO.Path]::GetTempFileName(); Remove-Item $work; New-Item -ItemType Directory -Path $work -Force | Out-Null
           git clone --quiet --depth 1 "https://x-access-token:***" $work 2>$null | Out-Null
-          if (Test-Path "$work\hermes-state.zip") { Copy-Item "$work\hermes-state.zip" "$env:USERPROFILE\hermes-restore.zip"; "RESTORE_ZIP=$env:USERPROFILE\hermes-restore.zip" >> $env:GITHUB_ENV }
+          $bestZip = $null; $bestStamp = ""
+          Get-ChildItem -Path $work -Filter "hermes-state-*.zip" | ForEach-Object {
+            $s = $_.BaseName -replace "^hermes-state-", ""
+            if ([string]::IsNullOrEmpty($bestStamp) -or $s -gt $bestStamp) { $bestStamp = $s; $bestZip = $_ }
+          }
+          if ($bestZip) { Copy-Item $bestZip.FullName "$env:USERPROFILE\hermes-restore.zip"; "RESTORE_ZIP=$env:USERPROFILE\hermes-restore.zip" >> $env:GITHUB_ENV; Write-Host "restoring $($bestZip.Name) (stamp $bestStamp)" } else { Write-Host "no backup zip found - starting from scratch" }
           Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 
       # ---------------------------------------------------------------- Hermes Desktop
@@ -163,12 +182,6 @@ jobs:
           New-Item -ItemType Directory -Path "$env:HERMES_HOME" -Force | Out-Null
           & "$env:USERPROFILE\.local\bin\hermes" config set model.provider custom
           & "$env:USERPROFILE\.local\bin\hermes" config set model.default "MyCombo"
-          if ($env:TELEGRAM_BOT_TOKEN) {
-            & "$env:USERPROFILE\.local\bin\hermes" config set platforms.telegram.enabled true
-            & "$env:USERPROFILE\.local\bin\hermes" config set platforms.telegram.home_channel.chat_id "$env:TELEGRAM_USER_ID"
-            & "$env:USERPROFILE\.local\bin\hermes" config set platforms.telegram.home_channel.name "$env:TELEGRAM_USER_ID"
-            & "$env:USERPROFILE\.local\bin\hermes" config set platforms.telegram.home_channel.user_id "$env:TELEGRAM_USER_ID"
-          }
 
       - name: Start Hermes gateway (headless CLI)
         shell: pwsh
@@ -176,40 +189,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path "$env:USERPROFILE\.hermes\logs" -Force | Out-Null
           Start-Process "$env:USERPROFILE\.local\bin\hermes" -ArgumentList "gateway", "run", "--replace" -RedirectStandardOutput "$env:USERPROFILE\.hermes\logs\gateway.log" -RedirectStandardError "$env:USERPROFILE\.hermes\logs\gateway.err" -WindowStyle Hidden
-
-      # ---------------------------------------------------------------- Telegram download bot
-      - name: Start local Telegram Bot API server
-        shell: pwsh
-        if: always()
-        continue-on-error: true
-        env:
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID || '147006' }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH || '' }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_DL_BOT_TOKEN }}
-        run: |
-          $botRoot = "$env:DLBOT_ROOT"
-          New-Item -ItemType Directory -Path "$botRoot\files", "$botRoot\tmp", "$botRoot\logs" -Force | Out-Null
-          if ([string]::IsNullOrEmpty($env:TELEGRAM_API_HASH)) { Write-Warning "no API hash"; exit 0 }
-          Start-Process "$env:USERPROFILE\.hermes\tools\telegram-bot-api\bin\telegram-bot-api.exe" -ArgumentList "--api-id=`"$env:TELEGRAM_API_ID`"", "--api-hash=`"$env:TELEGRAM_API_HASH`"", "--local", "--http-address=127.0.0.1", "--http-port=8081", "--dir=`"$botRoot\tgbotapi`"", "--temp-dir=`"$botRoot\tmp`"" -RedirectStandardOutput "$botRoot\logs\botapi.log" -WindowStyle Hidden
-          for ($i = 1; $i -le 20; $i++) { try { Invoke-RestMethod -Uri "http://127.0.0.1:8081/bot$env:TELEGRAM_BOT_TOKEN/getMe" -TimeoutSec 3 -ErrorAction Stop; break } catch { Start-Sleep -Seconds 3 } }
-
-      - name: Start Telegram download bot
-        shell: pwsh
-        if: always()
-        continue-on-error: true
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_DL_BOT_TOKEN }}
-          DLBOT_ADMIN_ID: "180329538"
-        run: |
-          $botRoot = "$env:DLBOT_ROOT"
-          New-Item -ItemType Directory -Path "$botRoot\files", "$botRoot\tmp", "$botRoot\logs" -Force | Out-Null
-          if (-not (Get-Command yt-dlp -ErrorAction SilentlyContinue)) { python3 -m pip install --user -q -U yt-dlp 2>$null | Out-Null }
-          Remove-Item -Recurse -Force "$botRoot\src" -ErrorAction SilentlyContinue
-          git clone --depth 1 -q "https://x-access-token:***" "$botRoot\src" 2>$null | Out-Null
-          if (Test-Path "$botRoot\src\dlbot") { Copy-Item "$botRoot\src\dlbot\*.py" -Destination "$botRoot\" -Force }
-          if (-not (Test-Path "$botRoot\bot.py")) { Write-Warning "no bot.py"; exit 0 }
-          Start-Process python3.exe -ArgumentList "-u", "$botRoot\bot.py" -RedirectStandardOutput "$botRoot\logs\bot.log" -RedirectStandardError "$botRoot\logs\bot.log" -WindowStyle Hidden
-          Start-Sleep -Seconds 8
 
       # ---------------------------------------------------------------- Keep alive
       - name: Keep alive
@@ -232,9 +211,6 @@ jobs:
         run: |
           Get-Process hermes -ErrorAction SilentlyContinue | Stop-Process -Force
           Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
-          Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like "*bot.py*" } | Stop-Process -Force
-          Get-Process telegram-bot-api -ErrorAction SilentlyContinue | Stop-Process -Force
-          Remove-Item -Recurse -Force "$env:DLBOT_ROOT\files", "$env:DLBOT_ROOT\tmp", "$env:DLBOT_ROOT\src" -ErrorAction SilentlyContinue
 
       # ---------------------------------------------------------------- Back up state to GitHub
       - name: Back up state to GitHub
@@ -246,16 +222,35 @@ jobs:
           $stamp = Get-Date -UFormat %Y%m%dT%H%M%SZ
           $out = Join-Path $env:RUNNER_TEMP "state-out"
           New-Item -ItemType Directory -Path $out -Force | Out-Null
-          & "$env:USERPROFILE\.local\bin\hermes" backup -o "$out\hermes-state.zip" 2>$null | Out-Null
+          & "$env:USERPROFILE\.local\bin\hermes" backup -o "$out\hermes-state-$stamp.zip" 2>$null | Out-Null
           $work = Join-Path $env:RUNNER_TEMP "state-push"
           New-Item -ItemType Directory -Path $work -Force | Out-Null
           git clone --quiet "https://x-access-token:***" $work 2>$null | Out-Null
           Copy-Item "$out\*.zip" $work -Force
           Set-Location $work
           git add -f ./*.zip
-          git -c user.name=github-actions -c user.email=github-actions@github.com commit -q -m "state $stamp" || true
-          git branch -M main
-          git push -q --force origin main
+          $push_ok = $false
+          for ($attempt = 1; $attempt -le 2; $attempt++) {
+            if (git -c user.name=github-actions -c user.email=github-actions@github.com commit -q -m "state $stamp" 2>$null) {
+              if (git push -q origin main 2>$null) {
+                $push_ok = $true
+                Write-Host "state ($stamp) pushed to $env:HERMES_BACKUP_REPO"
+                break
+              } else {
+                Write-Warning "push rejected; re-cloning and retrying (attempt $attempt)"
+                Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+                git clone --quiet "https://x-access-token:***" $work 2>$null | Out-Null
+                Copy-Item "$out\*.zip" $work -Force
+                Set-Location $work
+                git add -f ./*.zip
+              }
+            } else {
+              Write-Host "no changes to commit"
+              $push_ok = $true
+              break
+            }
+          }
+          if (-not $push_ok) { Write-Warning "push failed after retries - state not saved" }
 
       - name: Leave tailnet
         shell: pwsh
