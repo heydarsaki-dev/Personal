@@ -37,7 +37,9 @@ jobs:
       - name: Record job start
         shell: pwsh
         run: |
+          $env:HERMES_HOME = "$env:USERPROFILE\.hermes"
           "JOB_START_EPOCH=$(Get-Date -UFormat %s)" >> $env:GITHUB_ENV
+          "HERMES_HOME=$env:HERMES_HOME" >> $env:GITHUB_ENV
           Write-Host "Job started at $(Get-Date -Format o) UTC"
 
       # ---------------------------------------------------------------- Tailscale
@@ -45,11 +47,13 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
-          $tokenResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/oauth/token" -Method Post -Body @{ client_id = $env:TS_CLIENT_ID; client_secret = $env:TS_CLIENT_SECRET; grant_type = "client_credentials" }
-          $headers = @{ Authorization = "Bearer $($tokenResponse.access_token)" }
-          $devices = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$env:TS_TAILNET/devices" -Headers $headers
-          $stale = $devices.devices | Where-Object { $_.hostname -eq $env:NODE_NAME }
-          foreach ($d in $stale) { Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$env:TS_TAILNET/devices/$($d.id)" -Method Delete -Headers $headers; Write-Host "removed $($d.id)" }
+          try {
+            $tokenResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/oauth/token" -Method Post -Body @{ client_id = $env:TS_CLIENT_ID; client_secret = $env:TS_CLIENT_SECRET; grant_type = "client_credentials" }
+            $headers = @{ Authorization = "Bearer $($tokenResponse.access_token)" }
+            $devices = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$env:TS_TAILNET/devices" -Headers $headers
+            $stale = $devices.devices | Where-Object { $_.hostname -eq $env:NODE_NAME }
+            foreach ($d in $stale) { Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$env:TS_TAILNET/devices/$($d.id)" -Method Delete -Headers $headers; Write-Host "removed $($d.id)" }
+          } catch { Write-Host "could not delete old tailnet nodes: $_" }
 
       - name: Install Tailscale
         shell: pwsh
@@ -75,15 +79,15 @@ jobs:
           } catch { }
           if ($ghVpn -and $ghVpn.addresses) {
             # Take the first IPv4 address (dotted-quad), ignore IPv6 and malformed entries
-            $exitIp = ($ghVpn.addresses | Where-Object { $_ -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$' })[0]
+            $exitIp = ($ghVpn.addresses | Where-Object { $_ -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(/\d+)?$' } | ForEach-Object { $_.Split('/')[0] })[0]
             if ($exitIp) {
-              & $ts up --exit-node=$exitIp --advertise-exit-node --advertise-tags=$env:EXIT_TAG --timeout=60s
+              & $ts up --exit-node=$exitIp --advertise-exit-node --advertise-tags=$env:EXIT_TAG --accept-dns=false --hostname=$env:NODE_NAME --timeout=60s
               Write-Host "exit node set to $exitIp (gh-vpn)"
             }
           }
           $tsStat = & $ts status
           if (-not $tsStat -or $tsStat -notmatch "exitNode") {
-            & $ts up --advertise-exit-node --advertise-tags=$env:EXIT_TAG --timeout=60s
+            & $ts up --advertise-exit-node --advertise-tags=$env:EXIT_TAG --accept-dns=false --hostname=$env:NODE_NAME --timeout=60s
             Write-Host "gh-vpn unreachable; advertising self ($env:NODE_NAME) as exit node"
           }
           $ip = & $ts ip -4
