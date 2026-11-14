@@ -1259,26 +1259,15 @@ jobs:
               git add -f ./*.zip
               if git -c user.name=github-actions -c user.email=github-actions@github.com \
                   commit -q -m "state ${stamp}" 2>/dev/null; then
-                # Abort if our local clock is older than HEAD (we'd clobber a newer state
-                # pushed by another machine while we were backing up).
-                now_s=$(date -u +%s)
-                head_s=$(git -c log.format=%ct -1 --format=%ct HEAD 2>/dev/null || echo "$now_s")
-                age=$((now_s - head_s))
-                if [ "$age" -lt 180 ]; then
-                  if git push -q origin "$branch" 2>/dev/null; then
-                    push_ok=1
-                    echo "state (${stamp}) pushed to ${HERMES_BACKUP_REPO}"
-                    break
-                  else
-                    echo "push rejected (non-fast-forward); re-cloning and retrying (attempt $attempt)"
-                    cd /
-                    rm -rf "$work"
-                    continue
-                  fi
-                else
-                  echo "local clock ${age}s behind HEAD; aborting push to avoid clobbering newer state"
+                if git push -q origin "$branch" 2>/dev/null; then
                   push_ok=1
+                  echo "state (${stamp}) pushed to ${HERMES_BACKUP_REPO}"
                   break
+                else
+                  echo "push rejected (non-fast-forward); re-cloning and retrying (attempt $attempt)"
+                  cd /
+                  rm -rf "$work"
+                  continue
                 fi
               else
                 echo "no changes to commit"
