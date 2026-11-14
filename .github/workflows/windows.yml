@@ -67,7 +67,7 @@ jobs:
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
           for ($i = 1; $i -le 30; $i++) { if (& $ts status 2>$null) { break }; Start-Sleep -Seconds 1 }
-          & $ts up --authkey=$env:TS_AUTHKEY --hostname=$env:NODE_NAME --advertise-exit-node --advertise-tags=$env:EXIT_TAG --accept-dns=false --ssh --timeout=60s
+          & $ts up --authkey=$env:TS_AUTHKEY --hostname=$env:NODE_NAME --advertise-exit-node --advertise-tags=$env:EXIT_TAG --accept-dns=false --timeout=60s
           Start-Sleep -Seconds 3
           $ip = & $ts ip -4
           "NODE_IP=$ip" >> $env:GITHUB_ENV
