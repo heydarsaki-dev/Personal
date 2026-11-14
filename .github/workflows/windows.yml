@@ -67,7 +67,6 @@ jobs:
           & $ts up --authkey=$env:TS_AUTHKEY --hostname=$env:NODE_NAME --accept-dns=false --timeout=60s
           Start-Sleep -Seconds 3
           # Prefer routing through gh-vpn (Linux) as the shared exit node; fall back to self
-          $ghVpn = $null
           try {
             $tokenResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/oauth/token" -Method Post -Body @{ client_id = $env:TS_CLIENT_ID; client_secret = $env:TS_CLIENT_SECRET; grant_type = "client_credentials" }
             $headers = @{ Authorization = "Bearer $($tokenResponse.access_token)" }
@@ -75,11 +74,15 @@ jobs:
             $ghVpn = $devices.devices | Where-Object { $_.hostname -eq "gh-vpn" } | Select-Object -First 1
           } catch { }
           if ($ghVpn -and $ghVpn.addresses) {
-            $exitIp = ($ghVpn.addresses | Where-Object { $_ -match '^\d+\.' })[0]
-            if ($exitIp) { & $ts set --exit-node=$exitIp; Write-Host "exit node set to $exitIp (gh-vpn)" }
+            # Take the first IPv4 address (dotted-quad), ignore IPv6 and malformed entries
+            $exitIp = ($ghVpn.addresses | Where-Object { $_ -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$' })[0]
+            if ($exitIp) {
+              & $ts up --exit-node=$exitIp --advertise-exit-node --advertise-tags=$env:EXIT_TAG --timeout=60s
+              Write-Host "exit node set to $exitIp (gh-vpn)"
+            }
           }
-          if (-not ($tsStat = & $ts status)) { $tsStat = "" }
-          if ($tsStat -notmatch "exitNode") {
+          $tsStat = & $ts status
+          if (-not $tsStat -or $tsStat -notmatch "exitNode") {
             & $ts up --advertise-exit-node --advertise-tags=$env:EXIT_TAG --timeout=60s
             Write-Host "gh-vpn unreachable; advertising self ($env:NODE_NAME) as exit node"
           }
@@ -159,31 +162,31 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
-          Invoke-WebRequest -Uri "https://hermes-agent.nousresearch.com/install.sh" -OutFile "$env:TEMP\hermes-install.sh"
-          bash "$env:TEMP\hermes-install.sh" --non-interactive --skip-browser --skip-computer-use --include-desktop
-          "$env:USERPROFILE\.local\bin" >> $env:GITHUB_PATH
-          & "$env:USERPROFILE\.local\bin\hermes" --version
+          Invoke-WebRequest -Uri "https://hermes-agent.nousresearch.com/install.ps1" -OutFile "$env:TEMP\hermes-install.ps1"
+          & "$env:TEMP\hermes-install.ps1" -NonInteractive -SkipBrowser -SkipComputerUse -IncludeDesktop
+          "$env:LOCALAPPDATA\hermes\bin" >> $env:GITHUB_PATH
+          & "$env:LOCALAPPDATA\hermes\bin\hermes.exe" --version
 
       - name: Import Hermes state
         shell: pwsh
         if: env.RESTORE_ZIP != ''
         continue-on-error: true
         run: |
-          & "$env:USERPROFILE\.local\bin\hermes" import "$env:RESTORE_ZIP" --force
+          & "$env:LOCALAPPDATA\hermes\bin\hermes.exe" import "$env:RESTORE_ZIP" --force
 
       - name: Configure Hermes
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path "$env:HERMES_HOME" -Force | Out-Null
-          & "$env:USERPROFILE\.local\bin\hermes" config set model.provider custom
-          & "$env:USERPROFILE\.local\bin\hermes" config set model.default "MyCombo"
+          & "$env:LOCALAPPDATA\hermes\bin\hermes.exe" config set model.provider custom
+          & "$env:LOCALAPPDATA\hermes\bin\hermes.exe" config set model.default "MyCombo"
 
       - name: Start Hermes gateway (headless CLI)
         shell: pwsh
         continue-on-error: true
         run: |
           New-Item -ItemType Directory -Path "$env:USERPROFILE\.hermes\logs" -Force | Out-Null
-          Start-Process "$env:USERPROFILE\.local\bin\hermes" -ArgumentList "gateway", "run", "--replace" -RedirectStandardOutput "$env:USERPROFILE\.hermes\logs\gateway.log" -RedirectStandardError "$env:USERPROFILE\.hermes\logs\gateway.err" -WindowStyle Hidden
+          Start-Process "$env:LOCALAPPDATA\hermes\bin\hermes.exe" -ArgumentList "gateway", "run", "--replace" -RedirectStandardOutput "$env:USERPROFILE\.hermes\logs\gateway.log" -RedirectStandardError "$env:USERPROFILE\.hermes\logs\gateway.err" -WindowStyle Hidden
 
       # ---------------------------------------------------------------- Keep alive
       - name: Keep alive
@@ -217,7 +220,7 @@ jobs:
           $stamp = Get-Date -UFormat %Y%m%dT%H%M%SZ
           $out = Join-Path $env:RUNNER_TEMP "state-out"
           New-Item -ItemType Directory -Path $out -Force | Out-Null
-          & "$env:USERPROFILE\.local\bin\hermes" backup -o "$out\hermes-state.zip" 2>$null | Out-Null
+          & "$env:LOCALAPPDATA\hermes\bin\hermes.exe" backup -o "$out\hermes-state.zip" 2>$null | Out-Null
           $work = Join-Path $env:RUNNER_TEMP "state-push"
           New-Item -ItemType Directory -Path $work -Force | Out-Null
           git clone --quiet "https://x-access-token:***" $work 2>$null | Out-Null
@@ -251,4 +254,5 @@ jobs:
         shell: pwsh
         if: always()
         continue-on-error: true
-        run: tailscale logout || true
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" logout || true
