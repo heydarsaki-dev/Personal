@@ -660,40 +660,15 @@ jobs:
             rm -rf "$work"
             exit 0
           fi
-          # Pick the newest zip across both machines (linux + windows write separate timestamped files)
-          best_zip=""; best_stamp=""
-          for f in "$work"/hermes-state-*.zip; do
-            [ -f "$f" ] || continue
-            stamp="${f##hermes-state-}"
-            stamp="${stamp%.zip}"
-            if [ -z "$best_stamp" ] || [ "$stamp" \> "$best_stamp" ]; then
-              best_stamp="$stamp"
-              best_zip="$f"
-            fi
-          done
-          if [ -n "$best_zip" ]; then
-            cp "$best_zip" "$HOME/hermes-restore.zip"
+          if [ -f "$work/hermes-state.zip" ]; then
+            cp "$work/hermes-state.zip" "$HOME/hermes-restore.zip"
             echo "RESTORE_ZIP=$HOME/hermes-restore.zip" >> "$GITHUB_ENV"
-            echo "restoring ${best_zip##*/} (stamp $best_stamp)"
           else
             echo "no backup zip found - starting from scratch"
           fi
-          if compgen -G "$work/omniroute-state-*.zip" > /dev/null; then
-            best_omni=""; best_ostamp=""
-            for f in "$work"/omniroute-state-*.zip; do
-              [ -f "$f" ] || continue
-              ostamp="${f##omniroute-state-}"
-              ostamp="${ostamp%.zip}"
-              if [ -z "$best_ostamp" ] || [ "$ostamp" \> "$best_ostamp" ]; then
-                best_ostamp="$ostamp"
-                best_omni="$f"
-              fi
-            done
-            if [ -n "$best_omni" ]; then
-              unzip -oq "$best_omni" -d "$HOME"
-              chmod 600 "$HOME/.omniroute/.env" 2>/dev/null || true
-              echo "restoring ${best_omni##*/}"
-            fi
+          if [ -f "$work/omniroute-state.zip" ]; then
+            unzip -oq "$work/omniroute-state.zip" -d "$HOME"
+            chmod 600 "$HOME/.omniroute/.env" 2>/dev/null || true
           fi
           rm -rf "$work"
 
@@ -1248,18 +1223,18 @@ jobs:
           rm -rf "$out"; mkdir -p "$out"
           ok=1
           if [ -x "$HOME/.local/bin/hermes" ]; then
-            if ! ~/.local/bin/hermes backup -o "$out/hermes-state-${stamp}.zip"; then
+            if ! ~/.local/bin/hermes backup -o "$out/hermes-state.zip"; then
               echo "::warning title=Backup::hermes backup failed"
               ok=0
             fi
           fi
           if [ -x "$HOME/omniroute-app/node_modules/.bin/omniroute" ] && [ -d "$HOME/.omniroute" ]; then
-            if ! ( cd "$HOME" && zip -qr "$out/omniroute-state-${stamp}.zip" .omniroute -x '.omniroute/logs/*' ); then
+            if ! ( cd "$HOME" && zip -qr "$out/omniroute-state.zip" .omniroute -x '.omniroute/logs/*' ); then
               echo "::warning title=Backup::omniroute backup failed"
               ok=0
             fi
           fi
-          if [ ! -f "$out/hermes-state-${stamp}.zip" ] && [ ! -f "$out/omniroute-state-${stamp}.zip" ]; then
+          if [ ! -f "$out/hermes-state.zip" ] && [ ! -f "$out/omniroute-state.zip" ]; then
             echo "no state captured - leaving existing backup untouched"
             exit 0
           fi

@@ -151,12 +151,7 @@ jobs:
           if ([string]::IsNullOrEmpty($env:HERMES_BACKUP_TOKEN)) { exit 0 }
           $work = [System.IO.Path]::GetTempFileName(); Remove-Item $work; New-Item -ItemType Directory -Path $work -Force | Out-Null
           git clone --quiet --depth 1 "https://x-access-token:***" $work 2>$null | Out-Null
-          $bestZip = $null; $bestStamp = ""
-          Get-ChildItem -Path $work -Filter "hermes-state-*.zip" | ForEach-Object {
-            $s = $_.BaseName -replace "^hermes-state-", ""
-            if ([string]::IsNullOrEmpty($bestStamp) -or $s -gt $bestStamp) { $bestStamp = $s; $bestZip = $_ }
-          }
-          if ($bestZip) { Copy-Item $bestZip.FullName "$env:USERPROFILE\hermes-restore.zip"; "RESTORE_ZIP=$env:USERPROFILE\hermes-restore.zip" >> $env:GITHUB_ENV; Write-Host "restoring $($bestZip.Name) (stamp $bestStamp)" } else { Write-Host "no backup zip found - starting from scratch" }
+          if (Test-Path "$work\hermes-state.zip") { Copy-Item "$work\hermes-state.zip" "$env:USERPROFILE\hermes-restore.zip"; "RESTORE_ZIP=$env:USERPROFILE\hermes-restore.zip" >> $env:GITHUB_ENV }
           Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 
       # ---------------------------------------------------------------- Hermes Desktop
@@ -222,7 +217,7 @@ jobs:
           $stamp = Get-Date -UFormat %Y%m%dT%H%M%SZ
           $out = Join-Path $env:RUNNER_TEMP "state-out"
           New-Item -ItemType Directory -Path $out -Force | Out-Null
-          & "$env:USERPROFILE\.local\bin\hermes" backup -o "$out\hermes-state-$stamp.zip" 2>$null | Out-Null
+          & "$env:USERPROFILE\.local\bin\hermes" backup -o "$out\hermes-state.zip" 2>$null | Out-Null
           $work = Join-Path $env:RUNNER_TEMP "state-push"
           New-Item -ItemType Directory -Path $work -Force | Out-Null
           git clone --quiet "https://x-access-token:***" $work 2>$null | Out-Null
