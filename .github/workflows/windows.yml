@@ -31,7 +31,6 @@ jobs:
       EXIT_TAG: tag:gh-exit
       HERMES_BACKUP_TOKEN: ${{ secrets.HERMES_BACKUP_TOKEN }}
       HERMES_BACKUP_REPO: heydarsaki-dev/HermesBackup
-      HERMES_HOME: $env:USERPROFILE\.hermes
     steps:
       # ---------------------------------------------------------------- Record job start
       - name: Record job start
